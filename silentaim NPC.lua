@@ -1,0 +1,1212 @@
+--// CONFIGURAÇÕES
+_G.SilentAim = false
+_G.FOV = 150
+_G.VisibleCheck = true
+_G.TeamCheck = true
+_G.TeamCheckForNPCs = false
+_G.Prediction = 0.165
+_G.UpdateRate = 0.1 -- Otimizado para melhor resposta
+_G.TargetMode = "NPCs" -- "NPCs", "Players", "Both"
+_G.AimPart = "Head" -- "Head", "Torso", "Both", "Random"
+_G.ShowTarget = true -- Mostrar informações do alvo
+_G.HitChance = 100 -- Chance de acerto (1-100%)
+_G.BulletTeleport = false -- Teleporte de bala para o alvo
+_G.ShowTargetName = true -- Mostrar nome do alvo
+_G.ShowTargetType = true -- Mostrar tipo (NPC/Player)
+_G.ShowTargetHP = true -- Mostrar HP do alvo
+_G.ShowTargetDistance = true -- Mostrar distância
+_G.ShowHitChance = true -- Mostrar chance de acerto
+_G.HighlightTarget = false -- Highlight no alvo
+_G.DebugNPCs = false -- Ativar para ver no console quais NPCs estão sendo detectados
+_G.AggressiveNPCDetection = false -- Detectar TODOS os modelos não-player como NPCs (MODO AGRESSIVO)
+
+--// NOVAS CONFIGURAÇÕES (PRIORIDADE)
+_G.TargetPriority = "Distance" -- "Crosshair", "Distance", "LowestHP"
+_G.StickyAim = true -- Se true, mantém o alvo até morrer ou sair do FOV (evita tremedeira)
+
+--// SERVIÇOS
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local Camera = workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+local Mouse = LocalPlayer:GetMouse()
+
+--// FOV CIRCLE
+local Circle = Drawing.new("Circle")
+Circle.Color = Color3.fromRGB(0, 255, 0)
+Circle.Thickness = 2
+Circle.Visible = false
+Circle.Radius = _G.FOV
+Circle.Transparency = 0.7
+Circle.Filled = false
+
+--// INFORMAÇÕES DO ALVO (TEXTO)
+local TargetInfo = Drawing.new("Text")
+TargetInfo.Visible = false
+TargetInfo.Color = Color3.fromRGB(255, 255, 255)
+TargetInfo.Size = 18
+TargetInfo.Font = 2
+TargetInfo.Outline = true
+TargetInfo.OutlineColor = Color3.fromRGB(0, 0, 0)
+TargetInfo.Text = ""
+
+--// HIGHLIGHT DO ALVO
+local TargetHighlight = nil
+local HighlightConnection = nil
+
+--// VARIÁVEIS
+local CurrentTarget = nil
+local TargetPart = nil
+local TargetInRange = false
+local NPCCache = {}
+local PlayerCache = {}
+local LastCacheUpdate = 0
+local CacheUpdateInterval = 2
+
+--// VARIÁVEIS PARA HOOKS (não limpar)
+local oldNamecall = nil
+local oldIndex = nil
+
+--// FUNÇÃO: CRIAR HIGHLIGHT
+local function CreateHighlight(target)
+    if not target or not target:IsA("Model") then return nil end
+    
+    -- Remover highlight antigo
+    if TargetHighlight then
+        TargetHighlight:Destroy()
+        TargetHighlight = nil
+    end
+    
+    if HighlightConnection then
+        HighlightConnection:Disconnect()
+        HighlightConnection = nil
+    end
+    
+    -- Criar novo highlight
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "SilentAimHighlight"
+    highlight.Adornee = target
+    highlight.FillColor = Color3.fromRGB(255, 50, 50)
+    highlight.FillTransparency = 0.7
+    highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+    highlight.OutlineTransparency = 0
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Parent = game:GetService("CoreGui")
+    
+    -- Conectar para remover quando o target for destruído
+    HighlightConnection = target.Destroying:Connect(function()
+        if highlight then
+            highlight:Destroy()
+            TargetHighlight = nil
+        end
+    end)
+    
+    return highlight
+end
+
+--// FUNÇÃO: ATUALIZAR HIGHLIGHT
+local function UpdateHighlight()
+    if not _G.HighlightTarget then
+        if TargetHighlight then
+            TargetHighlight:Destroy()
+            TargetHighlight = nil
+        end
+        if HighlightConnection then
+            HighlightConnection:Disconnect()
+            HighlightConnection = nil
+        end
+        return
+    end
+    
+    if CurrentTarget then
+        if not TargetHighlight or TargetHighlight.Adornee ~= CurrentTarget then
+            TargetHighlight = CreateHighlight(CurrentTarget)
+        end
+        
+        if TargetHighlight then
+            -- Atualizar cores baseado no tipo de alvo
+            local isPlayer = false
+            for _, data in pairs(PlayerCache) do
+                if data.Model == CurrentTarget then
+                    isPlayer = true
+                    break
+                end
+            end
+            
+            if isPlayer then
+                TargetHighlight.FillColor = Color3.fromRGB(50, 150, 255)  -- Azul para players
+            else
+                TargetHighlight.FillColor = Color3.fromRGB(255, 50, 50)   -- Vermelho para NPCs
+            end
+            
+            -- Pulsar quando houver hit chance alta
+            if _G.HitChance >= 80 then
+                local pulse = math.sin(tick() * 3) * 0.2 + 0.8
+                TargetHighlight.FillTransparency = 0.7 + (0.2 * (1 - pulse))
+            else
+                TargetHighlight.FillTransparency = 0.7
+            end
+        end
+    else
+        if TargetHighlight then
+            TargetHighlight:Destroy()
+            TargetHighlight = nil
+        end
+        if HighlightConnection then
+            HighlightConnection:Disconnect()
+            HighlightConnection = nil
+        end
+    end
+end
+
+--// FUNÇÃO DE LIMPEZA DA UI APENAS
+local function CleanupUIOnly()
+    -- Limpar círculo FOV
+    if Circle then 
+        Circle.Visible = false
+    end
+    
+    -- Limpar texto do alvo
+    if TargetInfo then
+        TargetInfo.Visible = false
+        TargetInfo.Text = ""  -- Garantir que o texto seja limpo
+    end
+    
+    -- Limpar highlight
+    if TargetHighlight then
+        TargetHighlight:Destroy()
+        TargetHighlight = nil
+    end
+    
+    if HighlightConnection then
+        HighlightConnection:Disconnect()
+        HighlightConnection = nil
+    end
+    
+    CurrentTarget = nil
+    TargetPart = nil
+    TargetInRange = false
+    NPCCache = {}
+    PlayerCache = {}
+end
+
+--// LISTA DE TAGS DE NPCs EXPANDIDA (MELHORADA)
+local NPCTags = {
+    -- NPC comum
+    "NPC", "Npc", "npc",
+    
+    -- Inimigos
+    "Enemy", "enemy", "Enemies", "enemies",
+    "Hostile", "hostile", "Bad", "bad", "BadGuy", "badguy",
+    "Foe", "foe", "Opponent", "opponent",
+    
+    -- Tipos de bots/mobs
+    "Bot", "bot", "Bots", "bots",
+    "Mob", "mob", "Mobs", "mobs",
+    "Monster", "monster", "Monsters", "monsters",
+    "Zombie", "zombie", "Zombies", "zombies",
+    "Creature", "creature", "Animal", "animal", "Beast", "beast",
+    
+    -- Vilões/adversários
+    "Villain", "villain", "Villian", "villian",
+    "Boss", "boss", "MiniBoss", "miniboss",
+    "Guard", "guard", "Guardian", "guardian",
+    "Soldier", "soldier", "Warrior", "warrior",
+    "Fighter", "fighter",
+    
+    -- Alvos
+    "Target", "target",
+    "Dummy", "dummy", "Dummies", "dummies",
+    "Practice", "practice", "Training", "training",
+    
+    -- Tipos específicos comuns
+    "Skeleton", "skeleton",
+    "Orc", "orc", "Goblin", "goblin",
+    "Troll", "troll", "Ogre", "ogre",
+    "Demon", "demon", "Devil", "devil",
+    "Ghost", "ghost", "Spirit", "spirit",
+    "Vampire", "vampire", "Werewolf", "werewolf",
+    "Dragon", "dragon", "Wyvern", "wyvern",
+    
+    -- Factions/gangs
+    "Gang", "gang", "Thug", "thug",
+    "Bandit", "bandit", "Raider", "raider",
+    "Pirate", "pirate", "Corsair", "corsair",
+    
+    -- Agentes
+    "Agent", "agent", "Assassin", "assassin",
+    "Mercenary", "mercenary", "Hunter", "hunter",
+    
+    -- Animações/robôs
+    "Robot", "robot", "Drone", "drone",
+    "Android", "android", "Cyborg", "cyborg",
+    "Automaton", "automaton",
+    
+    -- Servos
+    "Servant", "servant", "Minion", "minion",
+    "Slave", "slave", "Pawn", "pawn",
+    
+    -- Códigos/programação
+    "AI", "ai", "A.I.",
+    "Char", "char", "Character", "character",
+    "Model", "model",
+    
+    -- Eventos especiais
+    "Event", "event", "Special", "special",
+    "Holiday", "holiday", "Seasonal", "seasonal",
+}
+
+--// FUNÇÃO DE DEBUG PARA NPCs
+local function DebugNPCDetection(character, reason)
+    if not _G.DebugNPCs then return end
+    print("[NPC DEBUG] Detectado:", character.Name)
+    print("  Razão:", reason)
+end
+
+--// FUNÇÃO: É PLAYER? (OTIMIZADA)
+local function IsPlayer(character)
+    if not character or not character:IsA("Model") then
+        return false
+    end
+    if character == LocalPlayer.Character then
+        return true
+    end
+    local player = Players:GetPlayerFromCharacter(character)
+    return player ~= nil
+end
+
+--// FUNÇÃO: É NPC? (MELHORADA PARA DETECTAR TODOS OS TIPOS)
+local function IsNPC(character)
+    if not character or not character:IsA("Model") then
+        return false
+    end
+    
+    -- Ignorar se for player
+    if IsPlayer(character) then
+        return false
+    end
+    
+    -- Verificar componentes básicos
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local head = character:FindFirstChild("Head")
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    
+    if not humanoid or not head or not hrp or humanoid.Health <= 0 then
+        return false
+    end
+    
+    -- MODO AGRESSIVO: Qualquer modelo com humanoid é NPC
+    if _G.AggressiveNPCDetection then
+        DebugNPCDetection(character, "Modo Agressivo - Estrutura de Humanoid")
+        return true
+    end
+    
+    local charName = character.Name:lower()
+    
+    -- MÉTODO 1: Verificar por tags no nome
+    for _, tag in pairs(NPCTags) do
+        if charName:find(tag:lower(), 1, true) then
+            DebugNPCDetection(character, "Tag no nome: " .. tag)
+            return true
+        end
+    end
+    
+    -- MÉTODO 2: Verificar por pastas específicas no workspace
+    local npcFolders = {
+        "NPCs", "Enemies", "Bots", "Mobs", "Targets", "Enemy", "Hostile",
+        "Monsters", "Zombies", "Creatures", "Characters", "Spawns",
+        "EnemySpawns", "NPCSpawns", "Bosses", "Minions"
+    }
+    
+    for _, folderName in pairs(npcFolders) do
+        local folder = workspace:FindFirstChild(folderName)
+        if folder and character:IsDescendantOf(folder) then
+            DebugNPCDetection(character, "Na pasta: " .. folderName)
+            return true
+        end
+    end
+    
+    -- MÉTODO 3: Verificar por valores/customizações específicas
+    local possibleNPCIndicators = {
+        "NPC", "IsNPC", "IsEnemy", "Hostile", "Enemy", 
+        "IsBot", "IsMob", "IsMonster", "Team", "Faction"
+    }
+    
+    for _, indicator in pairs(possibleNPCIndicators) do
+        local value = character:FindFirstChild(indicator)
+        if value then
+            if value:IsA("BoolValue") then
+                if indicator == "NPC" or indicator == "IsNPC" or 
+                   indicator == "IsEnemy" or indicator == "Hostile" then
+                    if value.Value == true then
+                        DebugNPCDetection(character, "BoolValue: " .. indicator .. " = true")
+                        return true
+                    end
+                end
+            elseif value:IsA("StringValue") then
+                local valLower = value.Value:lower()
+                if valLower == "enemy" or valLower == "hostile" or 
+                   valLower == "npc" or valLower == "bot" or
+                   valLower == "monster" or valLower == "mob" then
+                    DebugNPCDetection(character, "StringValue: " .. indicator .. " = " .. value.Value)
+                    return true
+                end
+            elseif value:IsA("IntValue") then
+                if indicator == "Team" then
+                    DebugNPCDetection(character, "Team Value: " .. value.Value)
+                    return true
+                end
+            end
+        end
+    end
+    
+    -- MÉTODO 4: Análise de estrutura do modelo (Scripts de IA)
+    local hasAIBehavior = false
+    for _, child in pairs(character:GetChildren()) do
+        local childName = child.Name:lower()
+        if child:IsA("Script") or child:IsA("LocalScript") then
+            if childName:find("ai") or childName:find("behavior") or 
+               childName:find("path") or childName:find("attack") or
+               childName:find("patrol") or childName:find("combat") then
+                hasAIBehavior = true
+                break
+            end
+        end
+    end
+    
+    -- MÉTODO 5: Verificar tags de CollectionService
+    local tags = CollectionService:GetTags(character)
+    for _, tag in pairs(tags) do
+        local tagLower = tag:lower()
+        for _, npcTag in pairs(NPCTags) do
+            if tagLower:find(npcTag:lower(), 1, true) then
+                DebugNPCDetection(character, "CollectionService Tag: " .. tag)
+                return true
+            end
+        end
+    end
+    
+    -- MÉTODO 6: Heurística avançada
+    local npcAbilities = {"Attack", "Damage", "Aggro", "Patrol", "Spawn", "Respawn", "AI", "BehaviorTree"}
+    for _, ability in pairs(npcAbilities) do
+        if character:FindFirstChild(ability) or character:FindFirstChild(ability .. "Script") then
+            hasAIBehavior = true
+            break
+        end
+    end
+    
+    if hasAIBehavior then
+        DebugNPCDetection(character, "Comportamento de IA detectado")
+        return true
+    end
+    
+    -- MÉTODO 7: Verificar pelo prefixo/sufixo no nome
+    local namePatterns = {"^npc_", "^enemy_", "^bot_", "^mob_", "_npc$", "_enemy$", "_bot$"}
+    for _, pattern in pairs(namePatterns) do
+        if string.match(charName, pattern) then
+            DebugNPCDetection(character, "Padrão no nome: " .. pattern)
+            return true
+        end
+    end
+    
+    -- Último recurso: Se tem estrutura de humanoide mas não é player, assumir que é NPC
+    DebugNPCDetection(character, "Estrutura de humanoid não-player (Genérico)")
+    return true
+end
+
+--// FUNÇÃO: BUSCAR NPCs EM TODAS AS PASTAS (RECURSIVO)
+local function FindNPCsInWorkspaceRecursive(parent)
+    local foundNPCs = {}
+    
+    for _, child in pairs(parent:GetChildren()) do
+        if child:IsA("Model") then
+            if IsNPC(child) then
+                table.insert(foundNPCs, child)
+            end
+        end
+        
+        -- Procurar recursivamente em subpastas
+        if not child:IsA("BasePart") and not child:IsA("Decal") and not child:IsA("Texture") then
+            local subNPCs = FindNPCsInWorkspaceRecursive(child)
+            for _, npc in pairs(subNPCs) do
+                table.insert(foundNPCs, npc)
+            end
+        end
+    end
+    
+    return foundNPCs
+end
+
+--// FUNÇÃO: VERIFICAR TIME (PLAYERS)
+local function IsEnemyPlayer(player)
+    if not _G.TeamCheck then
+        return true
+    end
+    
+    if not player then
+        return false
+    end
+    
+    if not LocalPlayer.Team or not player.Team then
+        return true
+    end
+    
+    return LocalPlayer.Team ~= player.Team
+end
+
+--// FUNÇÃO: VERIFICAR TIME (NPCs)
+local function IsEnemyNPC(npcModel)
+    if not _G.TeamCheckForNPCs then
+        return true
+    end
+    
+    -- Verificar se o NPC tem uma propriedade de time
+    local npcTeamValue = npcModel:FindFirstChild("Team")
+    if npcTeamValue and npcTeamValue:IsA("StringValue") then
+        local npcTeam = npcTeamValue.Value
+        local localTeam = LocalPlayer.Team and LocalPlayer.Team.Name or ""
+        
+        if npcTeam and localTeam and npcTeam ~= localTeam then
+            return true
+        end
+    end
+    
+    -- Verificar por BoolValue de inimigo
+    local isEnemy = npcModel:FindFirstChild("IsEnemy")
+    if isEnemy and isEnemy:IsA("BoolValue") and isEnemy.Value == true then
+        return true
+    end
+    
+    return true
+end
+
+--// FUNÇÃO: SELECIONAR PARTE DO ALVO
+local function GetTargetPart(character)
+    if _G.AimPart == "Head" then
+        return character:FindFirstChild("Head")
+    elseif _G.AimPart == "Torso" then
+        return character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso") or character:FindFirstChild("HumanoidRootPart")
+    elseif _G.AimPart == "Random" then
+        local parts = {
+            character:FindFirstChild("Head"),
+            character:FindFirstChild("UpperTorso"),
+            character:FindFirstChild("Torso"),
+            character:FindFirstChild("HumanoidRootPart")
+        }
+        for _, part in pairs(parts) do
+            if part then return part end
+        end
+    elseif _G.AimPart == "Both" then
+        local head = character:FindFirstChild("Head")
+        local torso = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso") or character:FindFirstChild("HumanoidRootPart")
+        if head and torso then
+            return tick() % 1 > 0.5 and head or torso
+        elseif head then
+            return head
+        elseif torso then
+            return torso
+        end
+    end
+    
+    return character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Head")
+end
+
+--// FUNÇÃO: ATUALIZAR CACHES
+local function UpdateCaches()
+    local currentTime = tick()
+    
+    if currentTime - LastCacheUpdate < CacheUpdateInterval then
+        return
+    end
+    
+    LastCacheUpdate = currentTime
+    
+    NPCCache = {}
+    PlayerCache = {}
+    
+    -- Buscar NPCs recursivamente no workspace
+    local allModels = {}
+    
+    -- Método 1: Modelos diretos no workspace
+    for _, model in pairs(workspace:GetChildren()) do
+        if model:IsA("Model") and model ~= LocalPlayer.Character then
+            table.insert(allModels, model)
+        end
+    end
+    
+    -- Método 2: Buscar em pastas específicas (recursivo)
+    local npcFolders = {"NPCs", "Enemies", "Bots", "Mobs", "Targets", 
+                        "Characters", "Spawns", "Monsters", "Zombies",
+                        "Enemy", "Hostile", "Bosses", "Minions", "Creatures"}
+    
+    for _, folderName in pairs(npcFolders) do
+        local folder = workspace:FindFirstChild(folderName)
+        if folder then
+            local npcsInFolder = FindNPCsInWorkspaceRecursive(folder)
+            for _, npc in pairs(npcsInFolder) do
+                table.insert(allModels, npc)
+            end
+        end
+    end
+    
+    -- Método 3: Buscar em TODAS as pastas do workspace se agressivo
+    if _G.AggressiveNPCDetection then
+        local allNPCs = FindNPCsInWorkspaceRecursive(workspace)
+        for _, npc in pairs(allNPCs) do
+            if npc ~= LocalPlayer.Character then
+                table.insert(allModels, npc)
+            end
+        end
+    end
+    
+    -- Processar todos os modelos encontrados
+    for _, model in pairs(allModels) do
+        local hrp = model:FindFirstChild("HumanoidRootPart")
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        
+        if hrp and humanoid and humanoid.Health > 0 then
+            if IsPlayer(model) then
+                PlayerCache[model] = {
+                    Model = model,
+                    HRP = hrp,
+                    Humanoid = humanoid,
+                    Player = Players:GetPlayerFromCharacter(model),
+                    IsNPC = false
+                }
+            elseif IsNPC(model) then
+                NPCCache[model] = {
+                    Model = model,
+                    HRP = hrp,
+                    Humanoid = humanoid,
+                    IsNPC = true
+                }
+            end
+        end
+    end
+    
+    -- Adicionar players manualmente
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local char = player.Character
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            local humanoid = char:FindFirstChildOfClass("Humanoid")
+            
+            if hrp and humanoid and humanoid.Health > 0 then
+                PlayerCache[char] = {
+                    Model = char,
+                    HRP = hrp,
+                    Humanoid = humanoid,
+                    Player = player,
+                    IsNPC = false
+                }
+            end
+        end
+    end
+    
+    -- Remover duplicatas
+    local seen = {}
+    local newNPCCache = {}
+    for model, data in pairs(NPCCache) do
+        if not seen[model] then
+            seen[model] = true
+            newNPCCache[model] = data
+        end
+    end
+    NPCCache = newNPCCache
+end
+
+--// FUNÇÃO: VERIFICAR SE O ALVO ATUAL AINDA É VÁLIDO (STICKY AIM)
+local function ValidateCurrentTarget()
+    if not CurrentTarget or not TargetPart then return false end
+    
+    -- Verificar se o alvo ainda existe e está vivo
+    local humanoid = CurrentTarget:FindFirstChildOfClass("Humanoid")
+    local hrp = CurrentTarget:FindFirstChild("HumanoidRootPart")
+    
+    if not humanoid or humanoid.Health <= 0 or not hrp then return false end
+    
+    -- Verificar se ainda está no FOV
+    local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local targetPos = TargetPart.Position
+    local screenPos, onScreen = Camera:WorldToViewportPoint(targetPos)
+    
+    if not onScreen then return false end
+    
+    local screenPoint = Vector2.new(screenPos.X, screenPos.Y)
+    local dist = (screenPoint - screenCenter).Magnitude
+    
+    if dist > _G.FOV then return false end
+    
+    -- Verificar parede
+    if _G.VisibleCheck then
+        local raycastParams = RaycastParams.new()
+        raycastParams.FilterDescendantsInstances = {LocalPlayer.Character, Camera}
+        raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
+        raycastParams.IgnoreWater = true
+        
+        local origin = Camera.CFrame.Position
+        local direction = (targetPos - origin).Unit * (targetPos - origin).Magnitude
+        local ray = workspace:Raycast(origin, direction, raycastParams)
+        
+        if ray then
+            local hitPart = ray.Instance
+            if not hitPart:IsDescendantOf(CurrentTarget) then
+                return false
+            end
+        end
+    end
+    
+    return true
+end
+
+--// FUNÇÃO: BUSCAR TARGET (ATUALIZADO COM SISTEMA DE PRIORIDADE)
+local function GetTarget()
+    if not LocalPlayer.Character then 
+        TargetInRange = false
+        TargetPart = nil
+        return nil 
+    end
+    
+    UpdateCaches()
+    
+    -- STICKY AIM: Se já temos um alvo e ele é válido, não trocar
+    if _G.StickyAim and CurrentTarget then
+        if ValidateCurrentTarget() then
+            TargetInRange = true
+            return CurrentTarget
+        else
+            CurrentTarget = nil
+            TargetPart = nil
+        end
+    end
+    
+    local bestScore = math.huge -- Menor é melhor
+    local closestPart = nil
+    local closestTarget = nil
+    local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local localChar = LocalPlayer.Character
+    local localRoot = localChar:FindFirstChild("HumanoidRootPart")
+    
+    TargetInRange = false
+    TargetPart = nil
+    
+    if not localRoot then return nil end
+    
+    local function ProcessTarget(data, isPlayer)
+        local hrp = data.HRP
+        local humanoid = data.Humanoid
+        
+        if hrp and humanoid and humanoid.Health > 0 then
+            -- Verificar Team Check
+            if isPlayer then
+                if not IsEnemyPlayer(data.Player) then return end
+            else
+                if not IsEnemyNPC(data.Model) then return end
+            end
+            
+            -- Selecionar parte do alvo
+            local targetPart = GetTargetPart(data.Model)
+            if not targetPart then targetPart = hrp end
+            
+            local targetPos = targetPart.Position
+            
+            if hrp.Velocity.Magnitude > 1 and _G.Prediction > 0 then
+                targetPos = targetPos + (hrp.Velocity * _G.Prediction)
+            end
+            
+            local screenPos, onScreen = Camera:WorldToViewportPoint(targetPos)
+            
+            if onScreen then
+                local screenPoint = Vector2.new(screenPos.X, screenPos.Y)
+                local distFromCenter = (screenPoint - screenCenter).Magnitude
+                
+                -- ALVO DENTRO DO FOV
+                if distFromCenter <= _G.FOV then
+                    local isVisible = true
+                    
+                    -- WALL CHECK
+                    if _G.VisibleCheck then
+                        local raycastParams = RaycastParams.new()
+                        raycastParams.FilterDescendantsInstances = {localChar, Camera}
+                        raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
+                        raycastParams.IgnoreWater = true
+                        
+                        local origin = Camera.CFrame.Position
+                        local direction = (targetPos - origin).Unit * (targetPos - origin).Magnitude
+                        local ray = workspace:Raycast(origin, direction, raycastParams)
+                        
+                        if ray then
+                            local hitPart = ray.Instance
+                            local isTargetPart = hitPart:IsDescendantOf(data.Model)
+                            if not isTargetPart then isVisible = false end
+                        end
+                    end
+                    
+                    TargetInRange = true
+                    
+                    -- LÓGICA DE PRIORIDADE
+                    if isVisible or not _G.VisibleCheck then
+                        local currentScore = 0
+                        
+                        if _G.TargetPriority == "Crosshair" then
+                            -- Prioridade padrão: Distância da mira
+                            currentScore = distFromCenter
+                        elseif _G.TargetPriority == "Distance" then
+                            -- Nova Prioridade: Distância 3D (perto do player)
+                            currentScore = (targetPos - localRoot.Position).Magnitude
+                        elseif _G.TargetPriority == "LowestHP" then
+                            -- Nova Prioridade: Menor Vida
+                            currentScore = humanoid.Health
+                        else
+                            currentScore = distFromCenter
+                        end
+                        
+                        if currentScore < bestScore then
+                            bestScore = currentScore
+                            closestPart = targetPart
+                            closestTarget = data.Model
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    if _G.TargetMode == "NPCs" or _G.TargetMode == "Both" then
+        for _, data in pairs(NPCCache) do ProcessTarget(data, false) end
+    end
+    
+    if _G.TargetMode == "Players" or _G.TargetMode == "Both" then
+        for _, data in pairs(PlayerCache) do ProcessTarget(data, true) end
+    end
+    
+    TargetPart = closestPart
+    return closestTarget
+end
+
+--// ATUALIZAR TARGET
+task.spawn(function()
+    while true do
+        task.wait(_G.UpdateRate)
+        if _G.SilentAim then
+            CurrentTarget = GetTarget()
+        else
+            CurrentTarget = nil
+            TargetInRange = false
+            TargetPart = nil
+        end
+    end
+end)
+
+--// FUNÇÃO: VERIFICAR SE DEVE ACERTAR (HIT CHANCE)
+local function ShouldHit()
+    if _G.HitChance >= 100 then
+        return true
+    end
+    if _G.HitChance <= 0 then
+        return false
+    end
+    local randomNumber = math.random(1, 100)
+    return randomNumber <= _G.HitChance
+end
+
+--// FUNÇÃO: CALCULAR CHANCE DE ACERTO DISPLAY
+local function CalculateHitChanceDisplay()
+    if not CurrentTarget or not TargetPart then
+        return 0
+    end
+    local baseChance = _G.HitChance
+    local distanceFactor = 1.0
+    local fovFactor = 1.0
+    
+    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        local localPos = LocalPlayer.Character.HumanoidRootPart.Position
+        local targetPos = TargetPart.Position
+        local distance = (targetPos - localPos).Magnitude
+        
+        if distance < 50 then distanceFactor = 1.1 
+        elseif distance > 200 then distanceFactor = 0.8 end
+    end
+    
+    if _G.FOV < 100 then fovFactor = 1.15 elseif _G.FOV > 250 then fovFactor = 0.9 end
+    local finalChance = baseChance * distanceFactor * fovFactor
+    local randomVariation = math.random(-5, 5)
+    finalChance = math.clamp(finalChance + randomVariation, 1, 100)
+    
+    return math.floor(finalChance)
+end
+
+--// FUNÇÃO: MOSTRAR INFORMAÇÕES DO ALVO
+local function UpdateTargetInfo()
+    if not _G.ShowTarget or not TargetInfo then
+        TargetInfo.Visible = false
+        TargetInfo.Text = "" 
+        return
+    end
+    
+    if not _G.SilentAim then
+        TargetInfo.Visible = false
+        TargetInfo.Text = "" 
+        return
+    end
+    
+    local shouldShowHitChance = _G.ShowHitChance and _G.HitChance > 0
+    
+    if CurrentTarget and TargetPart then
+        local screenPos, onScreen = Camera:WorldToViewportPoint(TargetPart.Position)
+        
+        if onScreen then
+            TargetInfo.Visible = true
+            TargetInfo.Position = Vector2.new(screenPos.X, screenPos.Y + 20)
+            
+            local infoLines = {}
+            
+            if _G.ShowTargetName then
+                local targetName = CurrentTarget.Name
+                local targetType = "NPC"
+                for _, data in pairs(PlayerCache) do
+                    if data.Model == CurrentTarget then
+                        targetType = "Player"
+                        targetName = data.Player.Name
+                        break
+                    end
+                end
+                
+                if _G.ShowTargetType then
+                    table.insert(infoLines, string.format("[%s] %s", targetType, targetName))
+                else
+                    table.insert(infoLines, targetName)
+                end
+            end
+            
+            if _G.ShowTargetHP then
+                local humanoid = CurrentTarget:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    local health = string.format("%.0f", humanoid.Health)
+                    local maxHealth = string.format("%.0f", humanoid.MaxHealth)
+                    table.insert(infoLines, string.format("HP: %s/%s", health, maxHealth))
+                end
+            end
+            
+            if _G.ShowTargetDistance then
+                if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                    local localPos = LocalPlayer.Character.HumanoidRootPart.Position
+                    local targetPos = TargetPart.Position
+                    local distance = string.format("%.1f", (targetPos - localPos).Magnitude)
+                    table.insert(infoLines, string.format("Dist: %s studs", distance))
+                end
+            end
+            
+            if shouldShowHitChance then
+                local displayChance = CalculateHitChanceDisplay()
+                table.insert(infoLines, string.format("Chance: %d%%", displayChance))
+            end
+            
+            if #infoLines > 0 then
+                TargetInfo.Text = table.concat(infoLines, "\n")
+            else
+                TargetInfo.Text = "Alvo travado"
+            end
+        else
+            TargetInfo.Visible = false
+            TargetInfo.Text = ""
+        end
+    else
+        TargetInfo.Visible = false
+        TargetInfo.Text = "" 
+    end
+end
+
+--// TELEPORTAR BALA PARA O ALVO (MELHORADO)
+local function TeleportBulletToTargetImproved(origin, direction, bulletName)
+    if not _G.BulletTeleport or not TargetPart or not CurrentTarget then
+        return origin, direction
+end
+    
+    local bulletNames = {"bullet", "ammo", "shot", "projectile", "missile", "rocket", "hit", "damage", "fire", "shoot"}
+    local isBullet = false
+    
+    for _, name in pairs(bulletNames) do
+        if string.find(bulletName:lower(), name) then
+            isBullet = true
+            break
+        end
+    end
+    
+    if not isBullet then return origin, direction end
+    if not ShouldHit() then return origin, direction end
+    
+    local targetPosition = TargetPart.Position
+    
+    if _G.Prediction > 0 and TargetPart.Parent:FindFirstChild("HumanoidRootPart") then
+        local hrp = TargetPart.Parent:FindFirstChild("HumanoidRootPart")
+        if hrp and hrp.Velocity.Magnitude > 1 then
+            targetPosition = targetPosition + (hrp.Velocity * _G.Prediction)
+        end
+    end
+    
+    local randomOffset = Vector3.new(
+        (math.random() - 0.5) * 0.5,
+        (math.random() - 0.5) * 0.3,
+        (math.random() - 0.5) * 0.5
+    )
+    
+    targetPosition = targetPosition + randomOffset
+    local newDirection = (targetPosition - origin).Unit * direction.Magnitude
+    
+    return origin, newDirection
+end
+
+--// HOOKS
+if not oldNamecall then
+    oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+        if not _G.SilentAim or not TargetPart or not CurrentTarget then
+            return oldNamecall(self, ...)
+        end
+        
+        local method = getnamecallmethod()
+        local args = {...}
+        
+        -- BULLET TELEPORT (Simples e Eficiente)
+        if _G.BulletTeleport and (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" then
+            local selfName = self.Name:lower()
+            -- Lógica para encontrar balas e modificar (simplificada para não quebrar jogos)
+            -- A lógica principal está em ShouldHit() e modificação direta de posição abaixo
+        end
+        
+        -- HIT REDIRECTION
+        if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" then
+            local selfName = self.Name:lower()
+            if string.find(selfName, "fire") or string.find(selfName, "hit") or string.find(selfName, "attack") or string.find(selfName, "damage") then
+                if not ShouldHit() then
+                    return oldNamecall(self, ...)
+                end
+                
+                local newArgs = {}
+                local modified = false
+                
+                for i, arg in pairs(args) do
+                    if typeof(arg) == "Vector3" then
+                        newArgs[i] = TargetPart.Position
+                        modified = true
+                    elseif typeof(arg) == "CFrame" then
+                        newArgs[i] = CFrame.new(TargetPart.Position)
+                        modified = true
+                    elseif typeof(arg) == "Ray" then
+                        local origin = arg.Origin
+                        newArgs[i] = Ray.new(origin, (TargetPart.Position - origin).Unit * 100)
+                        modified = true
+                    else
+                        newArgs[i] = arg
+                    end
+                end
+        
+                if modified then
+                    return oldNamecall(self, unpack(newArgs))
+                end
+            end
+        end
+        
+        if method == "Raycast" and self == workspace then
+            local origin = args[1]
+            local direction = args[2]
+            
+            if origin and TargetPart then
+                if not ShouldHit() then
+                    return oldNamecall(self, ...)
+                end
+                
+                local newDir = (TargetPart.Position - origin).Unit * direction.Magnitude
+                return oldNamecall(self, origin, newDir, args[3], args[4])
+            end
+        end
+        
+        return oldNamecall(self, ...)
+    end)
+end
+
+if not oldIndex then
+    oldIndex = hookmetamethod(game, "__index", function(self, key)
+        if self == Mouse and _G.SilentAim and TargetPart then
+            local keyLower = string.lower(key)
+            if keyLower == "hit" then
+                if not ShouldHit() then
+                    return oldIndex(self, key)
+                end
+                return CFrame.new(TargetPart.Position)
+            elseif keyLower == "target" then
+                return TargetPart
+            end
+        end
+        return oldIndex(self, key)
+    end)
+end
+
+--// UPDATE LOOP (VISUALS)
+local lastCircleUpdate = 0
+RunService.RenderStepped:Connect(function()
+    local currentTime = tick()
+    if currentTime - lastCircleUpdate < 0.1 then return end
+    lastCircleUpdate = currentTime
+    
+    Circle.Visible = _G.SilentAim
+    
+    if _G.SilentAim then
+        local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+        Circle.Position = screenCenter
+        Circle.Radius = _G.FOV
+        
+        if CurrentTarget then
+            local isPlayerTarget = false
+            for _, data in pairs(PlayerCache) do
+                if data.Model == CurrentTarget then
+                    isPlayerTarget = true
+                    break
+                end
+            end
+            
+            if isPlayerTarget then
+                Circle.Color = Color3.fromRGB(0, 150, 255)
+            else
+                Circle.Color = Color3.fromRGB(0, 255, 0)
+            end
+        else
+            if TargetInRange then
+                Circle.Color = Color3.fromRGB(255, 255, 0)
+            else
+                Circle.Color = Color3.fromRGB(255, 50, 0)
+            end
+        end
+    else
+        Circle.Visible = false
+    end
+    
+    UpdateTargetInfo()
+    UpdateHighlight()
+end)
+
+--// ==================================================
+--// MANO GUSTAVO UI LIBRARY
+--// ==================================================
+
+local Library = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/Mano-Gustavo/Mano-Gustavo-Library/refs/heads/main/library.lua"
+))()
+
+local Window = Library:CreateWindow({
+    Title = "🎯 Silent Aim v3.0 (Priority)",
+    Author = "Silent Aim NPC",
+    Keybind = Enum.KeyCode.RightControl
+})
+
+--// CRIAR ABAS
+local TabMain = Window:CreateTab("Principal")
+local TabPriority = Window:CreateTab("Prioridade")
+local TabConfig = Window:CreateTab("Configurações")
+local TabAim = Window:CreateTab("Mira")
+local TabTeam = Window:CreateTab("Time")
+local TabExtra = Window:CreateTab("Extra")
+local TabNPC = Window:CreateTab("NPC")
+local TabInfo = Window:CreateTab("Informações")
+
+--// ABA PRINCIPAL
+TabMain:CreateLabel("=== Controle Principal ===")
+TabMain:CreateToggle("Silent Aim", function(Value)
+    _G.SilentAim = Value
+    if Value then
+        LastCacheUpdate = 0; UpdateCaches()
+        Library:Notification({Title = "🎯 SILENT AIM", Text = "ATIVADO", Duration = 1.5, Type = "Success"})
+    else
+        if TargetHighlight then TargetHighlight:Destroy(); TargetHighlight = nil end
+        Library:Notification({Title = "🎯 SILENT AIM", Text = "DESATIVADO", Duration = 1.5, Type = "Error"})
+    end
+end, false)
+
+TabMain:CreateSlider("FOV", 50, 300, 150, function(Value) _G.FOV = math.floor(Value); Circle.Radius = _G.FOV end)
+TabMain:CreateSlider("Predição", 0, 0.5, 0.165, function(Value) _G.Prediction = tonumber(string.format("%.3f", Value)) end)
+TabMain:CreateSlider("Hit Chance", 0, 100, 100, function(Value) _G.HitChance = math.floor(Value) end)
+TabMain:CreateSlider("Taxa de Atualização", 0.05, 0.5, 0.1, function(Value) _G.UpdateRate = tonumber(string.format("%.2f", Value)) end)
+
+--// ABA PRIORIDADE
+TabPriority:CreateLabel("=== Lógica de Alvo ===")
+TabPriority:CreateLabel("Como o script escolhe quem focar:")
+
+TabPriority:CreateDropdown("Modo de Prioridade", {"Crosshair", "Distance", "LowestHP"}, function(Value)
+    _G.TargetPriority = Value
+    CurrentTarget = nil -- Resetar alvo ao mudar
+    Library:Notification({Title = "Modo Alterado", Text = "Prioridade: " .. Value, Duration = 2})
+end)
+
+TabPriority:CreateToggle("Sticky Aim (Travar Alvo)", function(Value)
+    _G.StickyAim = Value
+end, true)
+
+TabPriority:CreateLabel("----------------")
+TabPriority:CreateLabel("• Crosshair: Perto da mira (Tela)")
+TabPriority:CreateLabel("• Distance: Perto de VOCÊ (3D)")
+TabPriority:CreateLabel("• LowestHP: Alvo com menos vida")
+TabPriority:CreateLabel("• Sticky Aim: Não troca de alvo rápido")
+
+--// ABA CONFIGURAÇÕES
+TabConfig:CreateLabel("=== Configurações Gerais ===")
+TabConfig:CreateDropdown("Modo de Alvo", {"NPCs", "Players", "Both"}, function(Value) _G.TargetMode = Value end)
+TabConfig:CreateDropdown("Parte do Corpo", {"Head", "Torso", "Both", "Random"}, function(Value) _G.AimPart = Value end)
+TabConfig:CreateToggle("Wall Check", function(Value) _G.VisibleCheck = Value end, true)
+TabConfig:CreateToggle("Bullet Teleport", function(Value) _G.BulletTeleport = Value end, false)
+TabConfig:CreateToggle("Mostrar Alvo", function(Value) _G.ShowTarget = Value end, true)
+
+--// ABA MIRA
+TabAim:CreateLabel("=== Configurações de Mira ===")
+TabAim:CreateLabel("Cabeça: Dano crítico | Torso: Dano médio")
+TabAim:CreateColorPicker("Cor do Círculo FOV", Color3.fromRGB(0, 255, 0), function(Color) Circle.Color = Color end)
+
+--// ABA TIME
+TabTeam:CreateLabel("=== Configurações de Time ===")
+TabTeam:CreateToggle("Team Check (Players)", function(Value) _G.TeamCheck = Value end, true)
+TabTeam:CreateToggle("Team Check (NPCs)", function(Value) _G.TeamCheckForNPCs = Value end, false)
+
+--// ABA EXTRA
+TabExtra:CreateLabel("=== Configurações Extras ===")
+TabExtra:CreateToggle("Highlight no Alvo", function(Value) _G.HighlightTarget = Value end, false)
+TabExtra:CreateColorPicker("Cor do Highlight NPC", Color3.fromRGB(255, 50, 50), function(Color) end)
+TabExtra:CreateColorPicker("Cor do Highlight Player", Color3.fromRGB(50, 150, 255), function(Color) end)
+TabExtra:CreateTextBox("Intervalo Cache (s)", "2", function(Text) local num = tonumber(Text); if num and num > 0 then CacheUpdateInterval = num end end)
+
+--// ABA NPC
+TabNPC:CreateLabel("=== Configurações de NPC ===")
+TabNPC:CreateToggle("Modo Agressivo", function(Value)
+    _G.AggressiveNPCDetection = Value
+    LastCacheUpdate = 0; UpdateCaches()
+    if Value then Library:Notification({Title = "⚠️ MODO AGRESSIVO", Text = "ATIVADO - Detectando TUDO", Duration = 2, Type = "Warning"}) end
+end, false)
+TabNPC:CreateToggle("Debug NPCs", function(Value) _G.DebugNPCs = Value end, false)
+TabNPC:CreateButton("Forçar Atualização de Cache", function() LastCacheUpdate = 0; UpdateCaches() end)
+TabNPC:CreateButton("Listar NPCs Detectados", function()
+    local npcCount = 0; for _ in pairs(NPCCache) do npcCount = npcCount + 1 end
+    Library:Notification({Title = "📊 DETECÇÃO", Text = string.format("NPCs: %d", npcCount), Duration = 2})
+end)
+
+--// ABA INFORMAÇÕES
+TabInfo:CreateLabel("=== Controles de Informações ===")
+TabInfo:CreateToggle("Mostrar Nome/Tipo", function(Value) _G.ShowTargetName = Value; if _G.SilentAim then UpdateTargetInfo() end end, true)
+TabInfo:CreateToggle("Mostrar HP", function(Value) _G.ShowTargetHP = Value; if _G.SilentAim then UpdateTargetInfo() end end, true)
+TabInfo:CreateToggle("Mostrar Distância", function(Value) _G.ShowTargetDistance = Value; if _G.SilentAim then UpdateTargetInfo() end end, true)
+TabInfo:CreateToggle("Mostrar Chance", function(Value) _G.ShowHitChance = Value; if _G.SilentAim then UpdateTargetInfo() end end, true)
+TabInfo:CreateLabel("Versão: 3.0 Priority")
+TabInfo:CreateButton("Limpar UI", function() CleanupUIOnly() end)
+
+Library:Notification({
+    Title = "🎯 SILENT AIM v3.0",
+    Text = "Sistema de Prioridade ativo!\nVá para a aba Prioridade para configurar.",
+    Duration = 4,
+    Type = "Success"
+})
+
+game:GetService("Players").PlayerRemoving:Connect(function(player)
+    if player == LocalPlayer then CleanupUIOnly() end
+end)
