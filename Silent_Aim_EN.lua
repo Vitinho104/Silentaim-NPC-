@@ -1,0 +1,1462 @@
+--[[
+    UNIVERSAL PRO SCRIPT
+    Version: 3.7 (Zero Delay + Silent Aim + ESP Pro + Bullet Teleport)
+    UI: Obsidian (Deividcomsono)
+    Save/Load: PasteWare-style (SaveManager + ThemeManager)
+    Language: English
+]]
+
+--// ==================================================
+--// 1. GLOBAL SETTINGS (SILENT AIM & ESP)
+--// ==================================================
+
+-- [SILENT AIM SETTINGS]
+_G.SilentAim         = false
+_G.FOV               = 150
+_G.VisibleCheck      = true
+_G.TeamCheck         = true
+_G.TeamCheckForNPCs  = false
+_G.Prediction        = 0.165
+_G.UpdateRate        = 0.01
+_G.TargetMode        = "NPCs"
+_G.AimPart           = "Head"
+_G.ShowTarget        = true
+_G.HitChance         = 100
+_G.BulletTeleport    = false
+_G.BulletTP          = false
+_G.ShowTargetName    = true
+_G.ShowTargetType    = true
+_G.ShowTargetHP      = true
+_G.ShowTargetDistance = true
+_G.ShowHitChance     = true
+_G.HighlightTarget   = false
+_G.HighlightNPCColor    = Color3.fromRGB(255, 50, 50)
+_G.HighlightPlayerColor = Color3.fromRGB(50, 150, 255)
+_G.DebugNPCs            = false
+_G.AggressiveNPCDetection = false
+_G.TargetPriority    = "Distance"
+_G.StickyAim         = true
+
+-- [ESP SETTINGS]
+getgenv().ESP_Config = {
+    Enabled          = false,
+    ShowPlayers      = true,
+    ShowNPCs         = true,
+    TeamCheck        = true,
+    MaxDistance      = 2500,
+    NameTextSize     = 16,
+    DistanceTextSize = 14,
+    InventoryTextSize = 13,
+    HPBarWidth       = 60,
+    HPBarHeight      = 6,
+    ShowBox          = true,
+    ShowLine         = true,
+    ShowStick        = true,
+    ShowName         = true,
+    ShowDistance     = true,
+    ShowHPBar        = true,
+    ShowEquippedItem = true,
+    ShowInventory    = false,
+    UseTeamColor     = true,
+    EnemyColor       = Color3.fromRGB(255, 80, 80),
+    AllyColor        = Color3.fromRGB(80, 255, 80),
+    LineColor        = Color3.fromRGB(255, 255, 0),
+    StickColor       = Color3.fromRGB(255, 255, 255)
+}
+
+--// ANTI-KICK PROTECTION (AUTO-ENABLED)
+task.spawn(function()
+    for k, v in pairs(getgc(true)) do
+        if pcall(function() return rawget(v, "indexInstance") end)
+            and type(rawget(v, "indexInstance")) == "table"
+            and (rawget(v, "indexInstance"))[1] == "kick"
+        then
+            setreadonly(v, false)
+            v.tvk = {
+                "kick",
+                function() return game.Workspace:WaitForChild("") end
+            }
+        end
+    end
+end)
+
+--// ==================================================
+--// 2. SERVICES & VARIABLES
+--// ==================================================
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local HttpService      = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local Camera           = workspace.CurrentCamera
+local LocalPlayer      = Players.LocalPlayer
+local Mouse            = LocalPlayer:GetMouse()
+
+--// SILENT AIM VARIABLES
+local Circle = Drawing.new("Circle")
+Circle.Color        = Color3.fromRGB(0, 255, 0)
+Circle.Thickness    = 2
+Circle.Visible      = false
+Circle.Radius       = _G.FOV
+Circle.Transparency = 0.7
+Circle.Filled       = false
+
+local TargetInfo = Drawing.new("Text")
+TargetInfo.Visible       = false
+TargetInfo.Color         = Color3.fromRGB(255, 255, 255)
+TargetInfo.Size          = 18
+TargetInfo.Font          = 2
+TargetInfo.Outline       = true
+TargetInfo.OutlineColor  = Color3.fromRGB(0, 0, 0)
+TargetInfo.Text          = ""
+
+local TargetHighlight    = nil
+local HighlightConnection = nil
+
+local CurrentTarget      = nil
+local TargetPart         = nil
+local TargetInRange      = false
+local NPCCache           = {}
+local PlayerCache        = {}
+local LastCacheUpdate    = 0
+local CacheUpdateInterval = 2
+
+local oldNamecall = nil
+local oldIndex    = nil
+
+--// ESP VARIABLES
+local ESP_Objects = {}
+
+--// ==================================================
+--// 3. SILENT AIM FUNCTIONS (WITH BULLET TELEPORT)
+--// ==================================================
+
+local function CreateHighlight(target)
+    if not target or not target:IsA("Model") then return nil end
+    if TargetHighlight then TargetHighlight:Destroy(); TargetHighlight = nil end
+    if HighlightConnection then HighlightConnection:Disconnect(); HighlightConnection = nil end
+
+    local highlight = Instance.new("Highlight")
+    highlight.Name                = "SilentAimHighlight"
+    highlight.Adornee             = target
+    highlight.FillColor           = Color3.fromRGB(255, 50, 50)
+    highlight.FillTransparency    = 0.7
+    highlight.OutlineColor        = Color3.fromRGB(255, 255, 255)
+    highlight.OutlineTransparency = 0
+    highlight.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Parent              = game:GetService("CoreGui")
+
+    HighlightConnection = target.Destroying:Connect(function()
+        if highlight then highlight:Destroy(); TargetHighlight = nil end
+    end)
+    return highlight
+end
+
+local function UpdateHighlight()
+    if not _G.HighlightTarget then
+        if TargetHighlight then TargetHighlight:Destroy(); TargetHighlight = nil end
+        if HighlightConnection then HighlightConnection:Disconnect(); HighlightConnection = nil end
+        return
+    end
+
+    if CurrentTarget then
+        if not TargetHighlight or TargetHighlight.Adornee ~= CurrentTarget then
+            TargetHighlight = CreateHighlight(CurrentTarget)
+        end
+        if TargetHighlight then
+            local isPlayer = false
+            for _, data in pairs(PlayerCache) do
+                if data.Model == CurrentTarget then isPlayer = true; break end
+            end
+
+            if isPlayer then
+                TargetHighlight.FillColor = _G.HighlightPlayerColor
+            else
+                TargetHighlight.FillColor = _G.HighlightNPCColor
+            end
+
+            if _G.HitChance >= 80 then
+                local pulse = math.sin(tick() * 3) * 0.2 + 0.8
+                TargetHighlight.FillTransparency = 0.7 + (0.2 * (1 - pulse))
+            else
+                TargetHighlight.FillTransparency = 0.7
+            end
+        end
+    else
+        if TargetHighlight then TargetHighlight:Destroy(); TargetHighlight = nil end
+        if HighlightConnection then HighlightConnection:Disconnect(); HighlightConnection = nil end
+    end
+end
+
+local function CleanupUIOnly()
+    if Circle then Circle.Visible = false end
+    if TargetInfo then TargetInfo.Visible = false; TargetInfo.Text = "" end
+    if TargetHighlight then TargetHighlight:Destroy(); TargetHighlight = nil end
+    if HighlightConnection then HighlightConnection:Disconnect(); HighlightConnection = nil end
+    CurrentTarget = nil; TargetPart = nil; TargetInRange = false
+    NPCCache = {}; PlayerCache = {}
+end
+
+local NPCTags = {
+    "NPC","Npc","npc","Enemy","enemy","Enemies","enemies",
+    "Hostile","hostile","Bad","bad","BadGuy","badguy","Foe","foe","Opponent","opponent",
+    "Bot","bot","Bots","bots","Mob","mob","Mobs","mobs","Monster","monster","Monsters","monsters",
+    "Zombie","zombie","Zombies","zombies","Creature","creature","Animal","animal","Beast","beast",
+    "Villain","villain","Villian","villian","Boss","boss","MiniBoss","miniboss",
+    "Guard","guard","Guardian","guardian","Soldier","soldier","Warrior","warrior","Fighter","fighter",
+    "Target","target","Dummy","dummy","Dummies","dummies","Practice","practice","Training","training",
+    "Skeleton","skeleton","Orc","orc","Goblin","goblin","Troll","troll","Ogre","ogre",
+    "Demon","demon","Devil","devil","Ghost","ghost","Spirit","spirit","Vampire","vampire","Werewolf","werewolf",
+    "Dragon","dragon","Wyvern","wyvern","Gang","gang","Thug","thug","Bandit","bandit","Raider","raider",
+    "Pirate","pirate","Corsair","corsair","Agent","agent","Assassin","assassin",
+    "Mercenary","mercenary","Hunter","hunter","Robot","robot","Drone","drone",
+    "Android","android","Cyborg","cyborg","Automaton","automaton","Servant","servant","Minion","minion",
+    "Slave","slave","Pawn","pawn","AI","ai","A.I.","Char","char","Character","character",
+    "Model","model","Event","event","Special","special","Holiday","holiday","Seasonal","seasonal"
+}
+
+local function DebugNPCDetection(character, reason)
+    if not _G.DebugNPCs then return end
+    print("[NPC DEBUG] Detected:", character.Name, "| Reason:", reason)
+end
+
+local function IsPlayer(character)
+    if not character or not character:IsA("Model") then return false end
+    if character == LocalPlayer.Character then return true end
+    return Players:GetPlayerFromCharacter(character) ~= nil
+end
+
+local function IsNPC(character)
+    if not character or not character:IsA("Model") then return false end
+    if IsPlayer(character) then return false end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local head     = character:FindFirstChild("Head")
+    local hrp      = character:FindFirstChild("HumanoidRootPart")
+
+    if not humanoid or not head or not hrp or humanoid.Health <= 0 then return false end
+
+    if _G.AggressiveNPCDetection then
+        DebugNPCDetection(character, "Aggressive Mode - Humanoid structure")
+        return true
+    end
+
+    local charName = character.Name:lower()
+
+    for _, tag in pairs(NPCTags) do
+        if charName:find(tag:lower(), 1, true) then
+            DebugNPCDetection(character, "Name tag: " .. tag); return true
+        end
+    end
+
+    local npcFolders = {
+        "NPCs","Enemies","Bots","Mobs","Targets","Enemy","Hostile",
+        "Monsters","Zombies","Creatures","Characters","Spawns",
+        "EnemySpawns","NPCSpawns","Bosses","Minions"
+    }
+    for _, folderName in pairs(npcFolders) do
+        local folder = workspace:FindFirstChild(folderName)
+        if folder and character:IsDescendantOf(folder) then
+            DebugNPCDetection(character, "In folder: " .. folderName); return true
+        end
+    end
+
+    local possibleNPCIndicators = {
+        "NPC","IsNPC","IsEnemy","Hostile","Enemy","IsBot","IsMob","IsMonster","Team","Faction"
+    }
+    for _, indicator in pairs(possibleNPCIndicators) do
+        local value = character:FindFirstChild(indicator)
+        if value then
+            if value:IsA("BoolValue")
+                and (indicator == "NPC" or indicator == "IsNPC" or indicator == "IsEnemy" or indicator == "Hostile")
+                and value.Value == true
+            then
+                DebugNPCDetection(character, "BoolValue: " .. indicator .. " = true"); return true
+            elseif value:IsA("StringValue") then
+                local valLower = value.Value:lower()
+                if valLower == "enemy" or valLower == "hostile" or valLower == "npc"
+                    or valLower == "bot" or valLower == "monster" or valLower == "mob"
+                then
+                    DebugNPCDetection(character, "StringValue: " .. indicator .. " = " .. value.Value); return true
+                end
+            elseif value:IsA("IntValue") and indicator == "Team" then
+                DebugNPCDetection(character, "Team Value: " .. value.Value); return true
+            end
+        end
+    end
+
+    local hasAIBehavior = false
+    for _, child in pairs(character:GetChildren()) do
+        local childName = child.Name:lower()
+        if child:IsA("Script") or child:IsA("LocalScript") then
+            if childName:find("ai") or childName:find("behavior") or childName:find("path")
+                or childName:find("attack") or childName:find("patrol") or childName:find("combat")
+            then
+                hasAIBehavior = true; break
+            end
+        end
+    end
+
+    local tags = CollectionService:GetTags(character)
+    for _, tag in pairs(tags) do
+        local tagLower = tag:lower()
+        for _, npcTag in pairs(NPCTags) do
+            if tagLower:find(npcTag:lower(), 1, true) then
+                DebugNPCDetection(character, "CollectionService Tag: " .. tag); return true
+            end
+        end
+    end
+
+    local npcAbilities = {"Attack","Damage","Aggro","Patrol","Spawn","Respawn","AI","BehaviorTree"}
+    for _, ability in pairs(npcAbilities) do
+        if character:FindFirstChild(ability) or character:FindFirstChild(ability .. "Script") then
+            hasAIBehavior = true; break
+        end
+    end
+
+    if hasAIBehavior then
+        DebugNPCDetection(character, "AI behavior detected"); return true
+    end
+
+    local namePatterns = {"^npc_","^enemy_","^bot_","^mob_","_npc$","_enemy$","_bot$"}
+    for _, pattern in pairs(namePatterns) do
+        if string.match(charName, pattern) then
+            DebugNPCDetection(character, "Name pattern: " .. pattern); return true
+        end
+    end
+
+    DebugNPCDetection(character, "Generic non-player humanoid structure")
+    return true
+end
+
+local function FindNPCsInWorkspaceRecursive(parent)
+    local foundNPCs = {}
+    for _, child in pairs(parent:GetChildren()) do
+        if child:IsA("Model") and IsNPC(child) then table.insert(foundNPCs, child) end
+        if not child:IsA("BasePart") and not child:IsA("Decal") and not child:IsA("Texture") then
+            local subNPCs = FindNPCsInWorkspaceRecursive(child)
+            for _, npc in pairs(subNPCs) do table.insert(foundNPCs, npc) end
+        end
+    end
+    return foundNPCs
+end
+
+local function IsEnemyPlayer(player)
+    if not _G.TeamCheck then return true end
+    if not player or not LocalPlayer.Team or not player.Team then return true end
+    return LocalPlayer.Team ~= player.Team
+end
+
+local function IsEnemyNPC(npcModel)
+    if not _G.TeamCheckForNPCs then return true end
+    local npcTeamValue = npcModel:FindFirstChild("Team")
+    if npcTeamValue and npcTeamValue:IsA("StringValue") then
+        local npcTeam  = npcTeamValue.Value
+        local localTeam = LocalPlayer.Team and LocalPlayer.Team.Name or ""
+        if npcTeam and localTeam and npcTeam ~= localTeam then return true end
+    end
+    local isEnemy = npcModel:FindFirstChild("IsEnemy")
+    if isEnemy and isEnemy:IsA("BoolValue") and isEnemy.Value == true then return true end
+    return true
+end
+
+local function GetTargetPart(character)
+    if _G.AimPart == "Head" then
+        return character:FindFirstChild("Head")
+    elseif _G.AimPart == "Torso" then
+        return character:FindFirstChild("UpperTorso")
+            or character:FindFirstChild("Torso")
+            or character:FindFirstChild("HumanoidRootPart")
+    elseif _G.AimPart == "Random" then
+        local parts = {
+            character:FindFirstChild("Head"),
+            character:FindFirstChild("UpperTorso"),
+            character:FindFirstChild("Torso"),
+            character:FindFirstChild("HumanoidRootPart")
+        }
+        for _, part in pairs(parts) do if part then return part end end
+    elseif _G.AimPart == "Both" then
+        local head  = character:FindFirstChild("Head")
+        local torso = character:FindFirstChild("UpperTorso")
+            or character:FindFirstChild("Torso")
+            or character:FindFirstChild("HumanoidRootPart")
+        if head and torso then return tick() % 1 > 0.5 and head or torso
+        elseif head then return head
+        elseif torso then return torso end
+    end
+    return character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Head")
+end
+
+local function UpdateCaches()
+    local currentTime = tick()
+    if currentTime - LastCacheUpdate < CacheUpdateInterval then return end
+    LastCacheUpdate = currentTime
+
+    local tempNPCCache    = {}
+    local tempPlayerCache = {}
+    local allModels       = {}
+
+    local wsChildren = workspace:GetChildren()
+    for _, model in pairs(wsChildren) do
+        if model:IsA("Model") and model ~= LocalPlayer.Character then
+            table.insert(allModels, model)
+        end
+    end
+
+    local npcFolders = {
+        "NPCs","Enemies","Bots","Mobs","Targets","Characters","Spawns",
+        "Monsters","Zombies","Enemy","Hostile","Bosses","Minions","Creatures"
+    }
+    for _, folderName in pairs(npcFolders) do
+        local folder = workspace:FindFirstChild(folderName)
+        if folder then
+            local npcsInFolder = FindNPCsInWorkspaceRecursive(folder)
+            for _, npc in pairs(npcsInFolder) do table.insert(allModels, npc) end
+        end
+    end
+
+    if _G.AggressiveNPCDetection then
+        local counter = 0
+        local descendants = workspace:GetDescendants()
+        for _, descendant in pairs(descendants) do
+            if descendant:IsA("Model") and descendant ~= LocalPlayer.Character then
+                table.insert(allModels, descendant)
+                counter = counter + 1
+                if counter % 150 == 0 then task.wait() end
+            end
+        end
+    end
+
+    local processCounter = 0
+    for _, model in pairs(allModels) do
+        processCounter = processCounter + 1
+        if processCounter % 200 == 0 then task.wait() end
+        local hrp      = model:FindFirstChild("HumanoidRootPart")
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        if hrp and humanoid and humanoid.Health > 0 then
+            if IsPlayer(model) then
+                tempPlayerCache[model] = {
+                    Model = model, HRP = hrp, Humanoid = humanoid,
+                    Player = Players:GetPlayerFromCharacter(model), IsNPC = false
+                }
+            elseif IsNPC(model) then
+                tempNPCCache[model] = {Model = model, HRP = hrp, Humanoid = humanoid, IsNPC = true}
+            end
+        end
+    end
+
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local char     = player.Character
+            local hrp      = char:FindFirstChild("HumanoidRootPart")
+            local humanoid = char:FindFirstChildOfClass("Humanoid")
+            if hrp and humanoid and humanoid.Health > 0 then
+                tempPlayerCache[char] = {
+                    Model = char, HRP = hrp, Humanoid = humanoid, Player = player, IsNPC = false
+                }
+            end
+        end
+    end
+
+    NPCCache    = tempNPCCache
+    PlayerCache = tempPlayerCache
+end
+
+local function ValidateCurrentTarget()
+    if not CurrentTarget or not TargetPart then return false end
+    local humanoid = CurrentTarget:FindFirstChildOfClass("Humanoid")
+    local hrp      = CurrentTarget:FindFirstChild("HumanoidRootPart")
+    if not humanoid or humanoid.Health <= 0 or not hrp then return false end
+
+    local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local targetPos    = TargetPart.Position
+    local screenPos, onScreen = Camera:WorldToViewportPoint(targetPos)
+    if not onScreen then return false end
+
+    local screenPoint = Vector2.new(screenPos.X, screenPos.Y)
+    local dist        = (screenPoint - screenCenter).Magnitude
+    if dist > _G.FOV then return false end
+
+    if _G.VisibleCheck then
+        local raycastParams = RaycastParams.new()
+        raycastParams.FilterDescendantsInstances = {LocalPlayer.Character, Camera}
+        raycastParams.FilterType  = Enum.RaycastFilterType.Blacklist
+        raycastParams.IgnoreWater = true
+        local origin    = Camera.CFrame.Position
+        local direction = (targetPos - origin).Unit * (targetPos - origin).Magnitude
+        local ray = workspace:Raycast(origin, direction, raycastParams)
+        if ray then
+            local hitPart = ray.Instance
+            if not hitPart:IsDescendantOf(CurrentTarget) then return false end
+        end
+    end
+    return true
+end
+
+local function GetTarget()
+    if not LocalPlayer.Character then
+        TargetInRange = false; TargetPart = nil; return nil
+    end
+    UpdateCaches()
+    if _G.StickyAim and CurrentTarget then
+        if ValidateCurrentTarget() then
+            TargetInRange = true; return CurrentTarget
+        else
+            CurrentTarget = nil; TargetPart = nil
+        end
+    end
+
+    local bestScore    = math.huge
+    local closestPart  = nil
+    local closestTarget = nil
+    local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local localChar    = LocalPlayer.Character
+    local localRoot    = localChar:FindFirstChild("HumanoidRootPart")
+
+    TargetInRange = false; TargetPart = nil
+    if not localRoot then return nil end
+
+    local function ProcessTarget(data, isPlayer)
+        local hrp      = data.HRP
+        local humanoid = data.Humanoid
+        if hrp and humanoid and humanoid.Health > 0 then
+            if isPlayer then
+                if not IsEnemyPlayer(data.Player) then return end
+            else
+                if not IsEnemyNPC(data.Model) then return end
+            end
+
+            local targetPart = GetTargetPart(data.Model)
+            if not targetPart then targetPart = hrp end
+
+            local targetPos = targetPart.Position
+            if hrp.Velocity.Magnitude > 1 and _G.Prediction > 0 then
+                targetPos = targetPos + (hrp.Velocity * _G.Prediction)
+            end
+
+            local screenPos, onScreen = Camera:WorldToViewportPoint(targetPos)
+            if onScreen then
+                local screenPoint    = Vector2.new(screenPos.X, screenPos.Y)
+                local distFromCenter = (screenPoint - screenCenter).Magnitude
+
+                if distFromCenter <= _G.FOV then
+                    local isVisible = true
+                    if _G.VisibleCheck then
+                        local raycastParams = RaycastParams.new()
+                        raycastParams.FilterDescendantsInstances = {localChar, Camera}
+                        raycastParams.FilterType  = Enum.RaycastFilterType.Blacklist
+                        raycastParams.IgnoreWater = true
+                        local origin    = Camera.CFrame.Position
+                        local direction = (targetPos - origin).Unit * (targetPos - origin).Magnitude
+                        local ray = workspace:Raycast(origin, direction, raycastParams)
+                        if ray then
+                            local hitPart = ray.Instance
+                            if not hitPart:IsDescendantOf(data.Model) then isVisible = false end
+                        end
+                    end
+
+                    TargetInRange = true
+                    if isVisible or not _G.VisibleCheck then
+                        local currentScore = 0
+                        if _G.TargetPriority == "Crosshair" then
+                            currentScore = distFromCenter
+                        elseif _G.TargetPriority == "Distance" then
+                            currentScore = (targetPos - localRoot.Position).Magnitude
+                        elseif _G.TargetPriority == "LowestHP" then
+                            currentScore = humanoid.Health
+                        else
+                            currentScore = distFromCenter
+                        end
+
+                        if currentScore < bestScore then
+                            bestScore      = currentScore
+                            closestPart    = targetPart
+                            closestTarget  = data.Model
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if _G.TargetMode == "NPCs"    or _G.TargetMode == "Both" then for _, data in pairs(NPCCache)    do ProcessTarget(data, false) end end
+    if _G.TargetMode == "Players" or _G.TargetMode == "Both" then for _, data in pairs(PlayerCache) do ProcessTarget(data, true)  end end
+
+    TargetPart = closestPart
+    return closestTarget
+end
+
+local function ShouldHit()
+    if _G.HitChance >= 100 then return true end
+    if _G.HitChance <= 0   then return false end
+    return math.random(1, 100) <= _G.HitChance
+end
+
+local function CalculateHitChanceDisplay()
+    if not CurrentTarget or not TargetPart then return 0 end
+    local baseChance    = _G.HitChance
+    local distanceFactor = 1.0
+    local fovFactor     = 1.0
+
+    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        local localPos  = LocalPlayer.Character.HumanoidRootPart.Position
+        local targetPos = TargetPart.Position
+        local distance  = (targetPos - localPos).Magnitude
+        if distance < 50 then distanceFactor = 1.1 elseif distance > 200 then distanceFactor = 0.8 end
+    end
+
+    if _G.FOV < 100 then fovFactor = 1.15 elseif _G.FOV > 250 then fovFactor = 0.9 end
+    local finalChance   = baseChance * distanceFactor * fovFactor
+    local randomVariation = math.random(-5, 5)
+    return math.floor(math.clamp(finalChance + randomVariation, 1, 100))
+end
+
+local function UpdateTargetInfo()
+    if not _G.ShowTarget or not TargetInfo or not _G.SilentAim then
+        TargetInfo.Visible = false; TargetInfo.Text = ""; return
+    end
+
+    local shouldShowHitChance = _G.ShowHitChance and _G.HitChance > 0
+    if CurrentTarget and TargetPart then
+        local screenPos, onScreen = Camera:WorldToViewportPoint(TargetPart.Position)
+        if onScreen then
+            TargetInfo.Visible  = true
+            TargetInfo.Position = Vector2.new(screenPos.X, screenPos.Y + 20)
+            local infoLines = {}
+
+            if _G.ShowTargetName then
+                local targetName = CurrentTarget.Name
+                local targetType = "NPC"
+                for _, data in pairs(PlayerCache) do
+                    if data.Model == CurrentTarget then
+                        targetType = "Player"; targetName = data.Player.Name; break
+                    end
+                end
+                if _G.ShowTargetType then
+                    table.insert(infoLines, string.format("[%s] %s", targetType, targetName))
+                else
+                    table.insert(infoLines, targetName)
+                end
+            end
+
+            if _G.ShowTargetHP then
+                local humanoid = CurrentTarget:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    table.insert(infoLines, string.format("HP: %.0f/%.0f", humanoid.Health, humanoid.MaxHealth))
+                end
+            end
+
+            if _G.ShowTargetDistance and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                local localPos  = LocalPlayer.Character.HumanoidRootPart.Position
+                local distance  = string.format("%.1f", (TargetPart.Position - localPos).Magnitude)
+                table.insert(infoLines, string.format("Dist: %s studs", distance))
+            end
+
+            if shouldShowHitChance then
+                table.insert(infoLines, string.format("Chance: %d%%", CalculateHitChanceDisplay()))
+            end
+
+            if #infoLines > 0 then
+                TargetInfo.Text = table.concat(infoLines, "\n")
+            else
+                TargetInfo.Text = "Target locked"
+            end
+        else
+            TargetInfo.Visible = false; TargetInfo.Text = ""
+        end
+    else
+        TargetInfo.Visible = false; TargetInfo.Text = ""
+    end
+end
+
+--// ==================================================
+--// 4. ESP PRO FUNCTIONS (FULLY OPTIMIZED)
+--// ==================================================
+
+local function newDrawing(t)
+    local obj    = Drawing.new(t)
+    obj.Visible  = false
+    obj.ZIndex   = 2
+    return obj
+end
+
+local function setDrawingVisibility(parts, isVisible)
+    for _, obj in pairs(parts) do
+        if obj.Visible ~= isVisible then obj.Visible = isVisible end
+    end
+end
+
+local function getCharacterHumanoid(model)
+    if not model or not model:IsA("Model") then return nil, nil end
+    local hum  = model:FindFirstChildOfClass("Humanoid")
+    if not hum then return nil, nil end
+    local root = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso")
+    if not root then return nil, nil end
+    return hum, root
+end
+
+local function getPlayerFromCharacterESP(model)
+    return Players:GetPlayerFromCharacter(model)
+end
+
+local function getEquippedToolName(model)
+    for _, v in ipairs(model:GetChildren()) do
+        if v:IsA("Tool") or v:IsA("Accessory") then return v.Name end
+    end
+    return nil
+end
+
+local function getInventoryItems(model)
+    local items = {}
+    local plr   = getPlayerFromCharacterESP(model)
+
+    for _, v in ipairs(model:GetChildren()) do
+        if v:IsA("Tool") then table.insert(items, v.Name .. " (Eq)") end
+    end
+
+    if plr and plr:FindFirstChild("Backpack") then
+        for _, v in ipairs(plr.Backpack:GetChildren()) do
+            if v:IsA("Tool") then table.insert(items, v.Name) end
+        end
+    end
+
+    if #items > 0 then return table.concat(items, "\n") end
+    return nil
+end
+
+local function getTeamColor(model)
+    local plr = getPlayerFromCharacterESP(model)
+    if plr and plr.Team then return plr.TeamColor and plr.TeamColor.Color or plr.Team.Color end
+    return nil
+end
+
+local function isAlly(model)
+    local plr = getPlayerFromCharacterESP(model)
+    if plr and LocalPlayer then
+        if LocalPlayer.Team and plr.Team and LocalPlayer.Team == plr.Team then return true end
+        if LocalPlayer.TeamColor and plr.TeamColor and LocalPlayer.TeamColor == plr.TeamColor then return true end
+    end
+    local teamValue = model:FindFirstChild("Team") or model:FindFirstChild("TeamColor")
+    if teamValue and LocalPlayer.Team then
+        if tostring(teamValue.Value) == tostring(LocalPlayer.Team.Name) then return true end
+    end
+    return false
+end
+
+local function createESP(model)
+    if ESP_Objects[model] then return end
+    local parts = {}
+    parts.Box           = newDrawing("Square"); parts.Box.Thickness = 1; parts.Box.Filled = false
+    parts.Line          = newDrawing("Line");   parts.Line.Thickness = 1
+    parts.Stick         = newDrawing("Line");   parts.Stick.Thickness = 1
+    parts.NameText      = newDrawing("Text");   parts.NameText.Center = true;    parts.NameText.Outline = true;    parts.NameText.Font = 2
+    parts.DistanceText  = newDrawing("Text");   parts.DistanceText.Center = true; parts.DistanceText.Outline = true; parts.DistanceText.Font = 2
+    parts.HPBarBack     = newDrawing("Square"); parts.HPBarBack.Filled = true;   parts.HPBarBack.Color = Color3.fromRGB(0,0,0)
+    parts.HPBar         = newDrawing("Square"); parts.HPBar.Filled = true
+    parts.HPText        = newDrawing("Text");   parts.HPText.Center = true;      parts.HPText.Outline = true; parts.HPText.Font = 2; parts.HPText.Size = 13
+    parts.ItemText      = newDrawing("Text");   parts.ItemText.Center = true;    parts.ItemText.Outline = true; parts.ItemText.Font = 2; parts.ItemText.Size = 13
+    parts.InventoryText = newDrawing("Text");   parts.InventoryText.Center = true; parts.InventoryText.Outline = true; parts.InventoryText.Font = 2; parts.InventoryText.Size = ESP_Config.InventoryTextSize
+
+    ESP_Objects[model] = parts
+
+    model.AncestryChanged:Connect(function(_, parent)
+        if not parent and ESP_Objects[model] then
+            for _, obj in pairs(ESP_Objects[model]) do if obj and obj.Remove then obj:Remove() end end
+            ESP_Objects[model] = nil
+        end
+    end)
+end
+
+local function worldToViewport(pos)
+    local v, onScreen = Camera:WorldToViewportPoint(pos)
+    return Vector2.new(v.X, v.Y), onScreen, v.Z
+end
+
+local function updateESP()
+    if not ESP_Config.Enabled then
+        for _, parts in pairs(ESP_Objects) do setDrawingVisibility(parts, false) end
+        return
+    end
+
+    local cameraPos = Camera.CFrame.Position
+
+    for model, parts in pairs(ESP_Objects) do
+        local hum, root = getCharacterHumanoid(model)
+
+        if not hum or not root or hum.Health <= 0 then
+            setDrawingVisibility(parts, false); continue
+        end
+
+        local isPlayer = (getPlayerFromCharacterESP(model) ~= nil)
+
+        if isPlayer and not ESP_Config.ShowPlayers then
+            setDrawingVisibility(parts, false); continue
+        end
+
+        if not isPlayer and not ESP_Config.ShowNPCs then
+            setDrawingVisibility(parts, false); continue
+        end
+
+        local distance = (root.Position - cameraPos).Magnitude
+        if distance > ESP_Config.MaxDistance then
+            setDrawingVisibility(parts, false); continue
+        end
+
+        local isModelAlly = isAlly(model)
+        if ESP_Config.TeamCheck and isModelAlly then
+            setDrawingVisibility(parts, false); continue
+        end
+
+        local rootPos, onScreen, depth = worldToViewport(root.Position)
+        if onScreen and depth > 0 then
+
+            local color = ESP_Config.EnemyColor
+            if isModelAlly then
+                color = ESP_Config.AllyColor
+            elseif ESP_Config.UseTeamColor then
+                local tc = getTeamColor(model)
+                if tc then color = tc end
+            end
+
+            local size = model:GetExtentsSize()
+
+            -- Box ESP
+            if ESP_Config.ShowBox then
+                local top      = root.Position + Vector3.new(0, size.Y / 2, 0)
+                local bottom   = root.Position - Vector3.new(0, size.Y / 2, 0)
+                local topV2,  on1 = worldToViewport(top)
+                local bottomV2, on2 = worldToViewport(bottom)
+                if on1 and on2 then
+                    local height = math.abs(topV2.Y - bottomV2.Y)
+                    local width  = height / 2
+                    parts.Box.Size     = Vector2.new(width, height)
+                    parts.Box.Position = Vector2.new(rootPos.X - width / 2, topV2.Y)
+                    parts.Box.Color    = color
+                    parts.Box.Visible  = true
+                else parts.Box.Visible = false end
+            else parts.Box.Visible = false end
+
+            -- Line ESP
+            if ESP_Config.ShowLine then
+                parts.Line.From    = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y)
+                parts.Line.To      = rootPos
+                parts.Line.Color   = ESP_Config.LineColor
+                parts.Line.Visible = true
+            else parts.Line.Visible = false end
+
+            -- Stick ESP
+            if ESP_Config.ShowStick then
+                local head    = model:FindFirstChild("Head") or root
+                local headV2, hOn = worldToViewport(head.Position)
+                local footV2, fOn = worldToViewport(root.Position - Vector3.new(0, size.Y / 2, 0))
+                if hOn and fOn then
+                    parts.Stick.From    = headV2; parts.Stick.To   = footV2
+                    parts.Stick.Color   = ESP_Config.StickColor;   parts.Stick.Visible = true
+                else parts.Stick.Visible = false end
+            else parts.Stick.Visible = false end
+
+            -- Name ESP
+            if ESP_Config.ShowName then
+                parts.NameText.Position = rootPos - Vector2.new(0, 30)
+                parts.NameText.Size     = ESP_Config.NameTextSize
+                parts.NameText.Color    = color
+                parts.NameText.Text     = model.Name
+                parts.NameText.Visible  = true
+            else parts.NameText.Visible = false end
+
+            -- Distance ESP
+            if ESP_Config.ShowDistance then
+                parts.DistanceText.Position = rootPos - Vector2.new(0, 15)
+                parts.DistanceText.Size     = ESP_Config.DistanceTextSize
+                parts.DistanceText.Color    = Color3.fromRGB(255, 255, 255)
+                parts.DistanceText.Text     = string.format("[%.0f m]", distance)
+                parts.DistanceText.Visible  = true
+            else parts.DistanceText.Visible = false end
+
+            -- HP Bar
+            local barYFinal = rootPos.Y + 25
+            local barHFinal = ESP_Config.HPBarHeight
+
+            if ESP_Config.ShowHPBar then
+                local hpPercent = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+                local barW, barH = ESP_Config.HPBarWidth, ESP_Config.HPBarHeight
+                local barX, barY = rootPos.X - barW / 2, rootPos.Y + 25
+                barYFinal = barY
+                parts.HPBarBack.Size     = Vector2.new(barW, barH)
+                parts.HPBarBack.Position = Vector2.new(barX, barY); parts.HPBarBack.Visible = true
+                parts.HPBar.Size         = Vector2.new(barW * hpPercent, barH)
+                parts.HPBar.Position     = Vector2.new(barX, barY)
+                parts.HPBar.Color        = Color3.fromRGB(255 * (1 - hpPercent), 255 * hpPercent, 0)
+                parts.HPBar.Visible      = true
+                parts.HPText.Position    = Vector2.new(rootPos.X, barY + barH + 8)
+                parts.HPText.Color       = Color3.fromRGB(255, 255, 255)
+                parts.HPText.Text        = string.format("%.0f / %.0f", hum.Health, hum.MaxHealth)
+                parts.HPText.Visible     = true
+            else
+                parts.HPBarBack.Visible = false; parts.HPBar.Visible = false; parts.HPText.Visible = false
+            end
+
+            -- Equipped Item
+            if ESP_Config.ShowEquippedItem then
+                local itemName = getEquippedToolName(model)
+                if itemName then
+                    parts.ItemText.Position = rootPos - Vector2.new(0, 45)
+                    parts.ItemText.Color    = Color3.fromRGB(120, 255, 120)
+                    parts.ItemText.Text     = "[" .. itemName .. "]"
+                    parts.ItemText.Visible  = true
+                else parts.ItemText.Visible = false end
+            else parts.ItemText.Visible = false end
+
+            -- Full Inventory ESP
+            if ESP_Config.ShowInventory then
+                local invText = getInventoryItems(model)
+                if invText then
+                    parts.InventoryText.Position = Vector2.new(rootPos.X, barYFinal + barHFinal + 25)
+                    parts.InventoryText.Size     = ESP_Config.InventoryTextSize
+                    parts.InventoryText.Color    = Color3.fromRGB(200, 200, 255)
+                    parts.InventoryText.Text     = invText
+                    parts.InventoryText.Visible  = true
+                else
+                    parts.InventoryText.Visible = false
+                end
+            else
+                parts.InventoryText.Visible = false
+            end
+
+        else
+            setDrawingVisibility(parts, false)
+        end
+    end
+end
+
+local function scanWorkspace()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local hum, root = getCharacterHumanoid(plr.Character)
+            if hum and root then createESP(plr.Character) end
+        end
+    end
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") then
+            local hum, root = getCharacterHumanoid(obj)
+            if hum and root then
+                local owner = getPlayerFromCharacterESP(obj)
+                if not owner or owner == nil then createESP(obj) end
+            end
+        end
+    end
+end
+
+--// ==================================================
+--// 5. HOOKS & LOOPS (SILENT AIM + BULLET TELEPORT)
+--// ==================================================
+
+local function applyBulletTeleport(origin, targetPart)
+    if not _G.BulletTP or not targetPart then return origin end
+    return (targetPart.CFrame * CFrame.new(0, 0, 1)).p
+end
+
+-- SILENT AIM HOOKS WITH BULLET TELEPORT
+if not oldNamecall then
+    oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+        if not _G.SilentAim or not TargetPart or not CurrentTarget then
+            return oldNamecall(self, ...)
+        end
+
+        local method = getnamecallmethod()
+        local args   = {...}
+
+        if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" then
+            local selfName = self.Name:lower()
+            if string.find(selfName, "fire") or string.find(selfName, "hit")
+                or string.find(selfName, "attack") or string.find(selfName, "damage")
+            then
+                if not ShouldHit() then return oldNamecall(self, ...) end
+
+                local newArgs  = {}
+                local modified = false
+
+                for i, arg in pairs(args) do
+                    if typeof(arg) == "Vector3" then
+                        newArgs[i] = _G.BulletTP and applyBulletTeleport(arg, TargetPart) or TargetPart.Position
+                        modified   = true
+                    elseif typeof(arg) == "CFrame" then
+                        local origin = arg.Position
+                        newArgs[i]   = CFrame.new(_G.BulletTP and applyBulletTeleport(origin, TargetPart) or TargetPart.Position)
+                        modified     = true
+                    elseif typeof(arg) == "Ray" then
+                        local origin = arg.Origin
+                        local newOrigin = _G.BulletTP and applyBulletTeleport(origin, TargetPart) or origin
+                        newArgs[i]  = Ray.new(newOrigin, (TargetPart.Position - newOrigin).Unit * 1000)
+                        modified    = true
+                    else
+                        newArgs[i] = arg
+                    end
+                end
+
+                if modified then return oldNamecall(self, unpack(newArgs)) end
+            end
+        end
+
+        if method == "Raycast" and self == workspace then
+            local origin    = args[1]
+            local direction = args[2]
+            if origin and TargetPart then
+                if not ShouldHit() then return oldNamecall(self, ...) end
+                local newOrigin = _G.BulletTP and applyBulletTeleport(origin, TargetPart) or origin
+                local newDir    = (TargetPart.Position - newOrigin).Unit * direction.Magnitude
+                return oldNamecall(self, newOrigin, newDir, args[3], args[4])
+            end
+        end
+
+        return oldNamecall(self, ...)
+    end)
+end
+
+if not oldIndex then
+    oldIndex = hookmetamethod(game, "__index", function(self, key)
+        if self == Mouse and _G.SilentAim and TargetPart then
+            local keyLower = string.lower(key)
+            if keyLower == "hit" then
+                if not ShouldHit() then return oldIndex(self, key) end
+                return CFrame.new(_G.BulletTP and applyBulletTeleport(self.Origin, TargetPart) or TargetPart.Position)
+            elseif keyLower == "target" then
+                return TargetPart
+            end
+        end
+        return oldIndex(self, key)
+    end)
+end
+
+-- SILENT AIM UPDATE LOOP (Zero Delay)
+task.spawn(function()
+    while true do
+        task.wait(_G.UpdateRate)
+        if _G.SilentAim then
+            CurrentTarget = GetTarget()
+        else
+            CurrentTarget = nil; TargetInRange = false; TargetPart = nil
+        end
+    end
+end)
+
+-- SILENT AIM VISUALS LOOP
+RunService.RenderStepped:Connect(function()
+    Circle.Visible = _G.SilentAim
+    if _G.SilentAim then
+        local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+        Circle.Position    = screenCenter
+        Circle.Radius      = _G.FOV
+
+        if CurrentTarget then
+            local isPlayerTarget = false
+            for _, data in pairs(PlayerCache) do
+                if data.Model == CurrentTarget then isPlayerTarget = true; break end
+            end
+            Circle.Color = isPlayerTarget and Color3.fromRGB(0, 150, 255) or Color3.fromRGB(0, 255, 0)
+        else
+            Circle.Color = TargetInRange and Color3.fromRGB(255, 255, 0) or Color3.fromRGB(255, 50, 0)
+        end
+    else
+        Circle.Visible = false
+    end
+
+    UpdateTargetInfo()
+    UpdateHighlight()
+end)
+
+-- ESP LOOPS & INITIAL EVENTS
+scanWorkspace()
+Players.PlayerAdded:Connect(function(plr)
+    plr.CharacterAdded:Connect(function(char)
+        task.wait(1)
+        local hum, root = getCharacterHumanoid(char)
+        if hum and root then createESP(char) end
+    end)
+end)
+
+for _, plr in pairs(Players:GetPlayers()) do
+    plr.CharacterAdded:Connect(function(char)
+        task.wait(1)
+        local hum, root = getCharacterHumanoid(char)
+        if hum and root then createESP(char) end
+    end)
+end
+
+workspace.DescendantAdded:Connect(function(obj)
+    if obj:IsA("Model") then
+        task.wait(0.2)
+        local hum, root = getCharacterHumanoid(obj)
+        if hum and root then
+            local owner = getPlayerFromCharacterESP(obj)
+            if not owner or owner == nil then createESP(obj) end
+        end
+    end
+end)
+
+RunService.RenderStepped:Connect(updateESP)
+
+Players.PlayerRemoving:Connect(function(player)
+    if player == LocalPlayer then CleanupUIOnly() end
+end)
+
+--// ==================================================
+--// 6. UI LIBRARY: OBSIDIAN (DEIVIDCOMSONO)
+--// ==================================================
+
+local repo        = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+local Library     = loadstring(game:HttpGet(repo .. "Library.lua"))()
+local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
+local SaveManager  = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
+
+local Window = Library:CreateWindow({
+    Title        = 'Universal Pro v3.7  |  Silent Aim + ESP + Bullet TP',
+    Center       = true,
+    AutoShow     = true,
+    TabPadding   = 8,
+    MenuFadeTime = 0.2
+})
+
+local Tabs = {
+    Aim      = Window:AddTab('Silent Aim'),
+    ESP      = Window:AddTab('ESP Pro'),
+    Settings = Window:AddTab('Settings')
+}
+
+--// ==================================================
+--// [ TAB 1: SILENT AIM ]
+--// ==================================================
+
+local AimMainBox = Tabs.Aim:AddLeftGroupbox('Main Controls')
+local silentAimToggle = AimMainBox:AddToggle('ToggleSilentAim', {
+    Text    = 'Enable Silent Aim',
+    Default = false,
+    Callback = function(Value)
+        _G.SilentAim = Value
+        if Value then
+            LastCacheUpdate = 0; UpdateCaches()
+            Library:Notify('SILENT AIM ENABLED', 1.5)
+        else
+            if TargetHighlight then TargetHighlight:Destroy(); TargetHighlight = nil end
+            Library:Notify('SILENT AIM DISABLED', 1.5)
+        end
+    end
+})
+AimMainBox:AddSlider('FOVSlider', {
+    Text     = 'FOV Radius',
+    Default  = 150,
+    Min      = 50,
+    Max      = 300,
+    Rounding = 0,
+    Compact  = false,
+    Callback = function(Value) _G.FOV = Value; Circle.Radius = Value end
+})
+AimMainBox:AddSlider('PredSlider', {
+    Text     = 'Prediction',
+    Default  = 0.165,
+    Min      = 0,
+    Max      = 0.5,
+    Rounding = 3,
+    Compact  = false,
+    Callback = function(Value) _G.Prediction = Value end
+})
+AimMainBox:AddSlider('ChanceSlider', {
+    Text     = 'Hit Chance',
+    Default  = 100,
+    Min      = 0,
+    Max      = 100,
+    Rounding = 0,
+    Compact  = false,
+    Callback = function(Value) _G.HitChance = Value end
+})
+AimMainBox:AddSlider('UpdateSlider', {
+    Text     = 'Update Rate',
+    Default  = 0.01,
+    Min      = 0,
+    Max      = 0.5,
+    Rounding = 2,
+    Compact  = false,
+    Callback = function(Value) _G.UpdateRate = Value end
+})
+
+local AimLogicBox = Tabs.Aim:AddLeftGroupbox('Target Logic')
+AimLogicBox:AddDropdown('PriorityDrop', {
+    Values   = {'Crosshair', 'Distance', 'LowestHP'},
+    Default  = 2,
+    Multi    = false,
+    Text     = 'Priority Mode',
+    Callback = function(Value) _G.TargetPriority = Value; CurrentTarget = nil end
+})
+AimLogicBox:AddToggle('StickyAimToggle', {
+    Text     = 'Sticky Aim (Lock Target)',
+    Default  = true,
+    Callback = function(Value) _G.StickyAim = Value end
+})
+AimLogicBox:AddDropdown('TargetDrop', {
+    Values   = {'NPCs', 'Players', 'Both'},
+    Default  = 1,
+    Multi    = false,
+    Text     = 'Target Mode',
+    Callback = function(Value) _G.TargetMode = Value end
+})
+AimLogicBox:AddDropdown('PartDrop', {
+    Values   = {'Head', 'Torso', 'Both', 'Random'},
+    Default  = 1,
+    Multi    = false,
+    Text     = 'Body Part',
+    Callback = function(Value) _G.AimPart = Value end
+})
+AimLogicBox:AddToggle('WallCheck', {
+    Text     = 'Wall Check (Visibility)',
+    Default  = true,
+    Callback = function(Value) _G.VisibleCheck = Value end
+})
+
+local AimNPCBox = Tabs.Aim:AddLeftGroupbox('NPC Settings')
+AimNPCBox:AddToggle('AgressiveNPC', {
+    Text     = 'Aggressive NPC Mode (Optimized)',
+    Default  = false,
+    Callback = function(Value)
+        _G.AggressiveNPCDetection = Value; LastCacheUpdate = 0; UpdateCaches()
+        if Value then Library:Notify('WARNING: AGGRESSIVE MODE ENABLED', 2) end
+    end
+})
+AimNPCBox:AddToggle('DebugNPCsToggle', {
+    Text     = 'Debug NPCs',
+    Default  = false,
+    Callback = function(Value) _G.DebugNPCs = Value end
+})
+AimNPCBox:AddInput('CacheInterval', {
+    Default  = '2',
+    Numeric  = true,
+    Finished = true,
+    Text     = 'Cache Interval (s)',
+    Tooltip  = 'Time to refresh the NPC/Player cache',
+    Callback = function(Value)
+        local num = tonumber(Value)
+        if num and num > 0 then CacheUpdateInterval = num end
+    end
+})
+AimNPCBox:AddButton('Force Cache Update', function()
+    LastCacheUpdate = 0; UpdateCaches()
+    Library:Notify('Cache Updated!', 1)
+end)
+
+local AimBulletTPBox = Tabs.Aim:AddRightGroupbox('Bullet Teleport (PasteWare)')
+AimBulletTPBox:AddToggle('ToggleBulletTP', {
+    Text     = 'Enable Bullet Teleport',
+    Default  = false,
+    Tooltip  = 'Teleports the shot origin close to the target.',
+    Callback = function(Value)
+        _G.BulletTP = Value
+        if Value then
+            Library:Notify('BULLET TP ENABLED', 2)
+        else
+            Library:Notify('BULLET TP DISABLED', 2)
+        end
+    end
+})
+AimBulletTPBox:AddLabel('Bypasses obstacles between you and the target.')
+AimBulletTPBox:AddLabel('Works with any weapon.')
+
+local AimInfoBox = Tabs.Aim:AddRightGroupbox('Visuals & Info')
+AimInfoBox:AddLabel('FOV Circle Color'):AddColorPicker('FOVColor', {
+    Default  = Color3.fromRGB(0, 255, 0),
+    Title    = 'FOV Color',
+    Callback = function(Value) Circle.Color = Value end
+})
+AimInfoBox:AddToggle('HighlightTgt', {
+    Text     = 'Target Highlight',
+    Default  = false,
+    Callback = function(Value) _G.HighlightTarget = Value end
+})
+AimInfoBox:AddLabel('NPC Highlight Color'):AddColorPicker('HNPCColor', {
+    Default  = Color3.fromRGB(255, 50, 50),
+    Title    = 'NPC Highlight',
+    Callback = function(Value) _G.HighlightNPCColor = Value; UpdateHighlight() end
+})
+AimInfoBox:AddLabel('Player Highlight Color'):AddColorPicker('HPlrColor', {
+    Default  = Color3.fromRGB(50, 150, 255),
+    Title    = 'Player Highlight',
+    Callback = function(Value) _G.HighlightPlayerColor = Value; UpdateHighlight() end
+})
+AimInfoBox:AddToggle('ShowTargetInfo', {
+    Text     = 'Show Target Info',
+    Default  = true,
+    Callback = function(Value) _G.ShowTarget = Value end
+})
+AimInfoBox:AddToggle('InfoName', {
+    Text     = 'Show Name / Type',
+    Default  = true,
+    Callback = function(Value) _G.ShowTargetName = Value; UpdateTargetInfo() end
+})
+AimInfoBox:AddToggle('InfoHP', {
+    Text     = 'Show HP',
+    Default  = true,
+    Callback = function(Value) _G.ShowTargetHP = Value; UpdateTargetInfo() end
+})
+AimInfoBox:AddToggle('InfoDist', {
+    Text     = 'Show Distance',
+    Default  = true,
+    Callback = function(Value) _G.ShowTargetDistance = Value; UpdateTargetInfo() end
+})
+AimInfoBox:AddToggle('InfoChance', {
+    Text     = 'Show Hit Chance',
+    Default  = true,
+    Callback = function(Value) _G.ShowHitChance = Value; UpdateTargetInfo() end
+})
+AimInfoBox:AddButton('Clear Aim UI', function() CleanupUIOnly() end)
+
+local AimTeamBox = Tabs.Aim:AddRightGroupbox('Team')
+AimTeamBox:AddToggle('TeamCheckPlr', {
+    Text     = 'Team Check (Players)',
+    Default  = true,
+    Callback = function(Value) _G.TeamCheck = Value end
+})
+AimTeamBox:AddToggle('TeamCheckNPC', {
+    Text     = 'Team Check (NPCs)',
+    Default  = false,
+    Callback = function(Value) _G.TeamCheckForNPCs = Value end
+})
+
+--// ==================================================
+--// [ TAB 2: ESP PRO ]
+--// ==================================================
+
+local ESPMainBox = Tabs.ESP:AddLeftGroupbox('Main Controls')
+ESPMainBox:AddToggle('ToggleESP', {
+    Text     = 'Enable ESP',
+    Default  = false,
+    Callback = function(Value) ESP_Config.Enabled = Value end
+})
+ESPMainBox:AddToggle('ESPPlayers', {
+    Text     = 'Show Players',
+    Default  = true,
+    Callback = function(Value) ESP_Config.ShowPlayers = Value end
+})
+ESPMainBox:AddToggle('ESPNPCs', {
+    Text     = 'Show NPCs',
+    Default  = true,
+    Callback = function(Value) ESP_Config.ShowNPCs = Value end
+})
+ESPMainBox:AddToggle('ESPTeamCheck', {
+    Text     = 'Team Check',
+    Default  = true,
+    Callback = function(Value) ESP_Config.TeamCheck = Value end
+})
+ESPMainBox:AddToggle('ESPTeamColor', {
+    Text     = 'Use Team Color',
+    Default  = true,
+    Callback = function(Value) ESP_Config.UseTeamColor = Value end
+})
+
+local ESPElemsBox = Tabs.ESP:AddLeftGroupbox('Visual Elements')
+ESPElemsBox:AddToggle('EBox',   { Text = 'Show Box',            Default = true,  Callback = function(Value) ESP_Config.ShowBox          = Value end })
+ESPElemsBox:AddToggle('ELine',  { Text = 'Show Line',           Default = true,  Callback = function(Value) ESP_Config.ShowLine         = Value end })
+ESPElemsBox:AddToggle('EStick', { Text = 'Show Stick',          Default = true,  Callback = function(Value) ESP_Config.ShowStick        = Value end })
+ESPElemsBox:AddToggle('EName',  { Text = 'Show Name',           Default = true,  Callback = function(Value) ESP_Config.ShowName         = Value end })
+ESPElemsBox:AddToggle('EDist',  { Text = 'Show Distance',       Default = true,  Callback = function(Value) ESP_Config.ShowDistance     = Value end })
+ESPElemsBox:AddToggle('EHP',    { Text = 'Show HP Bar',         Default = true,  Callback = function(Value) ESP_Config.ShowHPBar        = Value end })
+ESPElemsBox:AddToggle('EEquip', { Text = 'Show Equipped Item',  Default = true,  Callback = function(Value) ESP_Config.ShowEquippedItem = Value end })
+ESPElemsBox:AddToggle('EInv',   { Text = 'Show Full Inventory', Default = false, Callback = function(Value) ESP_Config.ShowInventory    = Value end })
+
+local ESPSizesBox = Tabs.ESP:AddRightGroupbox('Sizes & Distance')
+ESPSizesBox:AddSlider('ESPMaxDist', { Text = 'Max Distance',      Default = 2500, Min = 500,  Max = 5000, Rounding = 0, Compact = false, Callback = function(Value) ESP_Config.MaxDistance      = Value end })
+ESPSizesBox:AddSlider('ESPNameS',   { Text = 'Name Text Size',    Default = 16,   Min = 8,    Max = 30,   Rounding = 0, Compact = true,  Callback = function(Value) ESP_Config.NameTextSize     = Value end })
+ESPSizesBox:AddSlider('ESPDistS',   { Text = 'Distance Text Size',Default = 14,   Min = 8,    Max = 30,   Rounding = 0, Compact = true,  Callback = function(Value) ESP_Config.DistanceTextSize = Value end })
+ESPSizesBox:AddSlider('ESPInvS',    { Text = 'Inventory Text Size',Default = 13,  Min = 8,    Max = 30,   Rounding = 0, Compact = true,  Callback = function(Value) ESP_Config.InventoryTextSize= Value end })
+
+local ESPColorsBox = Tabs.ESP:AddRightGroupbox('ESP Colors')
+ESPColorsBox:AddLabel('Enemy Color'):AddColorPicker('CEnemy', { Default = Color3.fromRGB(255, 80, 80),  Title = 'Enemy',  Callback = function(Value) ESP_Config.EnemyColor = Value end })
+ESPColorsBox:AddLabel('Ally Color') :AddColorPicker('CAlly',  { Default = Color3.fromRGB(80, 255, 80),  Title = 'Ally',   Callback = function(Value) ESP_Config.AllyColor  = Value end })
+ESPColorsBox:AddLabel('Line Color') :AddColorPicker('CLine',  { Default = Color3.fromRGB(255, 255, 0),  Title = 'Line',   Callback = function(Value) ESP_Config.LineColor  = Value end })
+ESPColorsBox:AddLabel('Stick Color'):AddColorPicker('CStick', { Default = Color3.fromRGB(255, 255, 255), Title = 'Stick', Callback = function(Value) ESP_Config.StickColor = Value end })
+
+--// ==================================================
+--// [ TAB 3: SETTINGS — Save/Load (PasteWare style) ]
+--// ==================================================
+
+Library:SetWatermark('Universal Pro v3.7')
+Library.KeybindFrame.Visible = false
+
+local MenuGroup = Tabs.Settings:AddLeftGroupbox('Menu')
+MenuGroup:AddButton('Unload Script', function() Library:Unload() end)
+MenuGroup:AddLabel('Menu Key'):AddKeyPicker('MenuKeybind', {
+    Default = 'RightControl',
+    NoUI    = true,
+    Text    = 'Menu Keybind'
+})
+
+Library.ToggleKeybind = Options.MenuKeybind
+
+-- ---- PasteWare-style Save/Load Integration ----
+
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
+
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({ 'MenuKeybind' })
+
+ThemeManager:SetFolder('UniversalPro')
+SaveManager:SetFolder('UniversalPro/configs')
+
+-- Builds the Config and Theme sections inside the Settings tab
+SaveManager:BuildConfigSection(Tabs.Settings)
+ThemeManager:BuildThemeSection(Tabs.Settings)
+
+-- Auto-loads the last saved config on script start
+SaveManager:LoadAutoloadConfig()
+
+-- Loads the default theme (PasteWare style — placed at end)
+ThemeManager:LoadDefaultTheme()
+
+-- ------------------------------------------------
+
+-- Initial Notification
+Library:Notify('Universal Pro v3.7 Loaded (Zero Delay)', 5)
+
+--// ==================================================
+--// PATCH: BULLET TELEPORT ANTI-DEATH PROTECTION
+--// (Does not modify any line above)
+--// ==================================================
+
+local BTP_LastHealth = nil
+local BTP_Protecting = false
+
+local function BTP_ProtectChar(char)
+    if not char then return end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+
+    BTP_LastHealth = humanoid.MaxHealth
+
+    humanoid.HealthChanged:Connect(function(newHealth)
+        if not _G.BulletTP then return end
+        if BTP_Protecting then return end
+
+        local delta = (BTP_LastHealth or humanoid.MaxHealth) - newHealth
+
+        if delta > 5 then
+            BTP_Protecting = true
+            task.defer(function()
+                if humanoid and humanoid.Parent then
+                    humanoid.Health = humanoid.MaxHealth
+                end
+                BTP_Protecting = false
+            end)
+        end
+
+        BTP_LastHealth = humanoid.Health
+    end)
+end
+
+if LocalPlayer.Character then
+    BTP_ProtectChar(LocalPlayer.Character)
+end
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+    task.wait(0.5)
+    BTP_ProtectChar(char)
+end)
