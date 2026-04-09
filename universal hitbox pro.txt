@@ -1,6 +1,6 @@
 --[[
-Script Original por: !vcsk0#1516
-Portado para Obsidian UI por: Gemini
+Script Original por: Vitor
+Portado para Obsidian UI por: Gusta
 Modificado para suporte a NPCs + Head/Body Hitbox + Melee Support
 ]]
 
